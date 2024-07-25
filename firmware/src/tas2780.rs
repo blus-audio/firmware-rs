@@ -1,5 +1,5 @@
 //! A driver for the TAS2780 class-D amplifier.
-use defmt::info;
+use defmt::trace;
 use embassy_time::Timer;
 use embedded_hal_1::i2c;
 
@@ -187,7 +187,7 @@ where
         let mut read: [u8; 1] = [0u8; 1];
         self.read(0x03, &mut read);
 
-        info!("Got {}", read);
+        trace!("Got {}", read);
 
         self.write_register(0x02, 0x80); // Power up playback with I-sense, V-sense enabled
     }
@@ -217,9 +217,23 @@ where
         self.book = None;
     }
 
+    pub fn enable(&mut self) {
+        // Set up power mode, and activate
+        match self.power_mode {
+            PowerMode::Two => {
+                self.set_page(0x00);
+                self.write_register(0x03, 0b11 << 6 | (self.gain as u8) << 1); // PWR_MODE2
+                self.write_register(0x04, 0xA1); // Use internal LDO
+                self.write_register(0x71, 0x0E); // PVDD undervoltage lockout 6.5 V
+                self.write_register(0x02, 0x80); // Power up playback with I-sense, V-sense enabled
+            }
+            _ => todo!("Unsupported power mode."),
+        }
+    }
+
     /// Initialize a TAS2780 amplifier to default settings.
     pub async fn init(&mut self) {
-        info!("Initializing TAS2780 at address {}.", self.address);
+        trace!("Initializing TAS2780 at address {}.", self.address);
 
         // Pre-reset configuration (as per the datasheet)
         self.set_page(0x01);
@@ -271,12 +285,15 @@ where
         tdm_cfg2 |= 0b11 << 2; // RX_WLEN: 32 bit
         tdm_cfg2 |= 0b10 << 0; // RX_SLEN: 32 bit
 
+        let tdm_cfg1 = 0; // RX_OFFSET = 0
+        self.write_register(0x09, tdm_cfg1);
+
         self.write_register(0x0A, tdm_cfg2);
         self.write_register(0x0B, tdm_cfg3);
 
         // Set up the noise gate, if enabled
         if let Some(noise_gate) = self.noise_gate {
-            info!("Enable TAS2780 noise gate.");
+            trace!("Enable TAS2780 noise gate.");
             const ENABLE_NOISE_GATE: u8 = 0b1;
 
             self.write_register(
@@ -298,15 +315,11 @@ where
                 self.write_register(0x0D, 0x0D); // Allow page access
                 self.write_register(0x3E, 0x4A); // Optimal Dmin
                 self.write_register(0x0D, 0x00); // Remove page access
-
-                self.set_page(0x00);
-                self.write_register(0x03, 0b11 << 6 | (self.gain as u8) << 1); // PWR_MODE2
-                self.write_register(0x04, 0xA1); // Use internal LDO
-                self.write_register(0x71, 0x0E); // PVDD undervoltage lockout 6.5 V
-                self.write_register(0x02, 0x80); // Power up playback with I-sense, V-sense enabled
             }
             _ => todo!("Unsupported power mode."),
         }
+
+        self.enable();
 
         // Set mute volume (-100 dB)
         self.set_volume(200);

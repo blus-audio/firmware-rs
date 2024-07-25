@@ -223,7 +223,7 @@ impl<'d, D: Driver<'d>> AudioClassOne<'d, D> {
         let streaming_endpoint = alt.alloc_endpoint_out(EndpointType::Isochronous, max_packet_size, 1);
         let synch_endpoint = alt.alloc_endpoint_in(
             EndpointType::Isochronous,
-            4, // Synch packets are always 32 bit
+            4, // Synch packets are 32 bit, of which 24 are filled.
             1,
         );
 
