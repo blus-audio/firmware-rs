@@ -22,7 +22,7 @@ use embassy_sync::{
         NoopMutex,
     },
     signal::Signal,
-    zerocopy_channel::{Channel, Receiver, Sender}, // Use for DMA/USB: https://github.com/embassy-rs/embassy/blob/main/examples/rp/src/bin/zerocopy.rs
+    zerocopy_channel::{Channel, Receiver, Sender},
 };
 use embassy_time::Timer;
 use embassy_usb::driver::EndpointError;
@@ -38,8 +38,8 @@ bind_interrupts!(struct Irqs {
 
 const DMA_BUFFER_SIZE: usize = 2048;
 const USB_PACKET_SIZE: usize = 96;
-const SAMPLE_COUNT: usize = 512; // USB_PACKET_SIZE / 4 * 2;
-const SAMPLE_BLOCK_COUNT: usize = 4;
+const SAMPLE_COUNT: usize = USB_PACKET_SIZE / 4 * 2;
+const SAMPLE_BLOCK_COUNT: usize = 2;
 
 static VOLUME_ADC_SIGNAL: Signal<ThreadModeRawMutex, u8> = Signal::new();
 
@@ -80,23 +80,6 @@ struct Sai4Resources {
     fs_b: peripherals::PE13,
     dma_b: peripherals::BDMA_CH1,
 }
-
-// #[embassy_executor::task]
-// async fn sai1a_task(mut sai_driver: sai::Sai<'static, peripherals::SAI1, u8>, mut status_led: Option<Output<'static>>) {
-//     sai_driver.start();
-
-//     if let Some(status_led) = &mut status_led {
-//         status_led.set_low();
-//     }
-
-//     let data = [0u8; 48];
-//     loop {
-//         if let Some(status_led) = &mut status_led {
-//             status_led.toggle();
-//         }
-//         unwrap!(sai_driver.write(&data).await);
-//     }
-// }
 
 #[embassy_executor::task]
 async fn audio_routing_task(
@@ -446,28 +429,16 @@ async fn main(spawner: Spawner) {
     unwrap!(spawner.spawn(volume_control_task(adc_resources)));
     unwrap!(spawner.spawn(amplifier_task(amplifier_resources)));
 
-    // unwrap!(spawner.spawn(sai1a_worker(sai1a_driver, None)));
-
-    // static DATA: StaticCell<&mut [u8]> = StaticCell::new();
-    // let data = DATA.init(unsafe { &mut SRAM4[DMA_SAMPLE_COUNT..2 * DMA_SAMPLE_COUNT] });
-
-    // let sai1a_write_buffer: &mut [u8] = unsafe {
-    //     SAI1A_WRITE_BUFFER.initialize_all_copied(0);
-    //     let (ptr, len) = SAI1A_WRITE_BUFFER.get_ptr_len();
-    //     core::slice::from_raw_parts_mut(ptr, len)
-    // };
-
     let receive_fut = async {
         loop {
             class.wait_connection().await;
             info!("Connected");
-            let _ = receive(&mut class, &mut sender, &mut led_green).await;
+            let _ = receive(&mut class, &mut sender).await;
             info!("Disconnected");
         }
     };
 
     // Run everything concurrently.
-    // If we had made everything `'static` above instead, we could do this using separate tasks instead.
     join(usb_fut, receive_fut).await;
 }
 
@@ -482,52 +453,31 @@ impl From<EndpointError> for Disconnected {
     }
 }
 
-const SINE: [u32; 200] = [
-    0, 0, 0, 0, 269151069, 0, 0, 0, 534057466, 0, 0, 0, 790541457, 0, 0, 0, 1034558137, 0, 0, 0, 1262259217, 0, 0, 0,
-    1470053716, 0, 0, 0, 1654664589, 0, 0, 0, 1813180413, 0, 0, 0, 1943101299, 0, 0, 0, 2042378317, 0, 0, 0,
-    2109445808, 0, 0, 0, 2143246079, 0, 0, 0, 2143246079, 0, 0, 0, 2109445808, 0, 0, 0, 2042378317, 0, 0, 0,
-    1943101299, 0, 0, 0, 1813180413, 0, 0, 0, 1654664589, 0, 0, 0, 1470053716, 0, 0, 0, 1262259217, 0, 0, 0,
-    1034558137, 0, 0, 0, 790541457, 0, 0, 0, 534057466, 0, 0, 0, 269151069, 0, 0, 0, 0, 0, 0, 0, 4025816227, 0, 0, 0,
-    3760909830, 0, 0, 0, 3504425839, 0, 0, 0, 3260409159, 0, 0, 0, 3032708079, 0, 0, 0, 2824913580, 0, 0, 0,
-    2640302707, 0, 0, 0, 2481786883, 0, 0, 0, 2351865997, 0, 0, 0, 2252588979, 0, 0, 0, 2185521488, 0, 0, 0,
-    2151721217, 0, 0, 0, 2151721217, 0, 0, 0, 2185521488, 0, 0, 0, 2252588979, 0, 0, 0, 2351865997, 0, 0, 0,
-    2481786883, 0, 0, 0, 2640302707, 0, 0, 0, 2824913580, 0, 0, 0, 3032708079, 0, 0, 0, 3260409159, 0, 0, 0,
-    3504425839, 0, 0, 0, 3760909830, 0, 0, 0, 4025816227, 0, 0, 0,
-];
-
 async fn receive<'d, T: usb::Instance + 'd>(
     class: &mut uac1::AudioClassOne<'d, usb::Driver<'d, T>>,
     sender: &mut Sender<'static, NoopRawMutex, SampleBlock>,
-    led: &mut Output<'static>,
 ) -> Result<(), Disconnected> {
     loop {
         // Obtain a free buffer from the channel
         let (samples, sample_count) = sender.send().await;
-        let mut total: usize = 0;
 
-        for _ in 0..4 {
-            led.set_high();
-            let mut usb_data = [0u8; USB_PACKET_SIZE];
-            led.set_low();
+        let mut usb_data = [0u8; USB_PACKET_SIZE];
 
-            let data_size = class.read_packet(&mut usb_data).await?;
-            let word_count = data_size / 4;
+        let data_size = class.read_packet(&mut usb_data).await?;
+        let word_count = data_size / 4;
 
-            for w in 0..word_count {
-                let sample: u32 = (usb_data[4 * w] as u32)
-                    | (usb_data[4 * w + 1] as u32) << 8
-                    | (usb_data[4 * w + 2] as u32) << 16
-                    | (usb_data[4 * w + 3] as u32) << 24;
+        for w in 0..word_count {
+            let sample: u32 = (usb_data[4 * w] as u32)
+                | (usb_data[4 * w + 1] as u32) << 8
+                | (usb_data[4 * w + 2] as u32) << 16
+                | (usb_data[4 * w + 3] as u32) << 24;
 
-                // Fill the sample buffer with data.
-                samples[2 * w + total] = sample;
-                samples[2 * w + 1 + total] = sample;
-            }
-
-            total += 2 * word_count;
+            // Fill the sample buffer with data.
+            samples[2 * w] = sample;
+            samples[2 * w + 1] = sample;
         }
 
-        *sample_count = total;
+        *sample_count = 2 * word_count;
 
         sender.send_done();
     }
