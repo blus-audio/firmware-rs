@@ -8,7 +8,7 @@ license = "GPL-3.0"
 embassy-stm32 = { version = "0.1.0", path = "../embassy/embassy-stm32", features = [
     "defmt",
     "stm32h723vg",
-    "time-driver-tim2",
+    "time-driver-tim5",
     "exti",
     "memory-x",
     "unstable-pac",
@@ -30,14 +30,6 @@ embassy-time = { version = "0.3.1", path = "../embassy/embassy-time", features =
     "defmt",
     "defmt-timestamp-uptime",
     "tick-hz-32_768",
-] }
-embassy-net = { version = "0.4.0", path = "../embassy/embassy-net", features = [
-    "defmt",
-    "tcp",
-    "dhcpv4",
-    "medium-ethernet",
-    "proto-ipv6",
-    "dns",
 ] }
 embassy-usb = { version = "0.2.0", path = "../embassy/embassy-usb", features = [
     "defmt",

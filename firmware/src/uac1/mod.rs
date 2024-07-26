@@ -1,35 +1,7 @@
 //! USB Audio class
 //!
 //! This crate provides a USB device class based on "Universal Serial Bus Device
-//! Class Definition for Audio Devices", Release 1.0 (experimental
-//! implementation without the aim of standard compliance).
-//!
-//! Since the USB descriptor can be quite large, it may be required to activate the feature
-//! `control-buffer-256` of the `usb-device` crate.
-//!
-//! Example
-//!
-//! ```ignore
-//! let mut usb_audio = AudioClassBuilder::new()
-//!     .input(
-//!         StreamConfig::new_discrete(
-//!             Format::S16le,
-//!             1,
-//!             &[48000],
-//!             TerminalType::InMicrophone).unwrap())
-//!     .output(
-//!         StreamConfig::new_discrete(
-//!             Format::S24le,
-//!             2,
-//!             &[44100, 48000, 96000],
-//!             TerminalType::OutSpeaker).unwrap())
-//!     .build(&usb_bus)
-//!     .unwrap();
-//! ```
-//!
-//! This example creates an audio device having a one channel (Mono) microphone
-//! with a fixed sampling frequency of 48 KHz and a two channel (Stereo) speaker
-//! output that supports three different sampling rates.
+//! Class Definition for Audio Devices", Release 1.0.
 use class_codes::*;
 
 use core::cell::{Cell, RefCell};
@@ -42,7 +14,7 @@ use embassy_sync::blocking_mutex::CriticalSectionMutex;
 use embassy_sync::waitqueue::WakerRegistration;
 use embassy_usb::control::{self, InResponse, OutResponse, Recipient, Request, RequestType};
 use embassy_usb::descriptor::{SynchronizationType, UsageType};
-use embassy_usb::driver::{Driver, Endpoint, EndpointAddress, EndpointError, EndpointIn, EndpointOut, EndpointType};
+use embassy_usb::driver::{Driver, Endpoint, EndpointError, EndpointIn, EndpointOut, EndpointType};
 use embassy_usb::types::InterfaceNumber;
 use embassy_usb::{Builder, Handler};
 
@@ -161,6 +133,8 @@ impl<'d, D: Driver<'d>> AudioClassOne<'d, D> {
 
         // Class-specific AC Interface Descriptor [UAC 4.3.2]
         let total_length = 125;
+
+        // FIXME: Calculate the length.
         // (2 + input_terminal_descriptor.len())
         //     + (2 + output_terminal_descriptor.len())
         //     + (2 + feature_unit_descriptor.len())

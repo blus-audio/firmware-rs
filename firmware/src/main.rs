@@ -38,7 +38,7 @@ bind_interrupts!(struct Irqs {
 
 const DMA_BUFFER_SIZE: usize = 2048;
 const USB_PACKET_SIZE: usize = 96;
-const SAMPLE_COUNT: usize = 200; // USB_PACKET_SIZE / 4 * 2;
+const SAMPLE_COUNT: usize = 512; // USB_PACKET_SIZE / 4 * 2;
 const SAMPLE_BLOCK_COUNT: usize = 4;
 
 static VOLUME_ADC_SIGNAL: Signal<ThreadModeRawMutex, u8> = Signal::new();
@@ -156,7 +156,7 @@ async fn audio_routing_task(
         status_led.set_low();
         sai4a_driver.set_mute(false);
 
-        if let Err(_) = sai4a_driver.write(&samples[..*sample_count * 2]).await {
+        if let Err(_) = sai4a_driver.write(&samples[..*sample_count]).await {
             drop(sai4a_driver);
             sai4a_driver = new_sai4a(&mut sai4_resources, sai4a_write_buffer);
             sai4a_driver.start();
@@ -328,10 +328,14 @@ async fn main(spawner: Spawner) {
     }
     let p = embassy_stm32::init(peripheral_config);
 
-    let led_blue = Output::new(p.PC6, Level::High, Speed::Low);
-    let led_green = Output::new(p.PC7, Level::High, Speed::Low);
-    let led_yellow = Output::new(p.PC8, Level::High, Speed::Low);
-    let led_red = Output::new(p.PC9, Level::High, Speed::Low);
+    let mut led_blue = Output::new(p.PC6, Level::High, Speed::Low);
+    let mut led_green = Output::new(p.PC7, Level::High, Speed::Low);
+    let mut led_yellow = Output::new(p.PC8, Level::High, Speed::Low);
+    let mut led_red = Output::new(p.PC9, Level::High, Speed::Low);
+
+    for led in [&mut led_blue, &mut led_green, &mut led_yellow, &mut led_red] {
+        led.set_low();
+    }
 
     let mut ep_out_buffer = [0u8; 1024];
     let mut config_descriptor = [0; 256];
@@ -457,7 +461,7 @@ async fn main(spawner: Spawner) {
         loop {
             class.wait_connection().await;
             info!("Connected");
-            let _ = receive(&mut class, &mut sender).await;
+            let _ = receive(&mut class, &mut sender, &mut led_green).await;
             info!("Disconnected");
         }
     };
@@ -494,28 +498,36 @@ const SINE: [u32; 200] = [
 async fn receive<'d, T: usb::Instance + 'd>(
     class: &mut uac1::AudioClassOne<'d, usb::Driver<'d, T>>,
     sender: &mut Sender<'static, NoopRawMutex, SampleBlock>,
+    led: &mut Output<'static>,
 ) -> Result<(), Disconnected> {
     loop {
         // Obtain a free buffer from the channel
         let (samples, sample_count) = sender.send().await;
+        let mut total: usize = 0;
 
-        let mut usb_data = [0u8; USB_PACKET_SIZE];
+        for _ in 0..4 {
+            led.set_high();
+            let mut usb_data = [0u8; USB_PACKET_SIZE];
+            led.set_low();
 
-        let data_size = class.read_packet(&mut usb_data).await?;
-        let word_count = data_size / 4;
+            let data_size = class.read_packet(&mut usb_data).await?;
+            let word_count = data_size / 4;
 
-        for w in 0..word_count {
-            let sample: u32 = (usb_data[4 * w] as u32)
-                | (usb_data[4 * w + 1] as u32) << 8
-                | (usb_data[4 * w + 2] as u32) << 16
-                | (usb_data[4 * w + 3] as u32) << 24;
+            for w in 0..word_count {
+                let sample: u32 = (usb_data[4 * w] as u32)
+                    | (usb_data[4 * w + 1] as u32) << 8
+                    | (usb_data[4 * w + 2] as u32) << 16
+                    | (usb_data[4 * w + 3] as u32) << 24;
 
-            // Fill the sample buffer with data.
-            samples[2 * w] = sample;
-            samples[2 * w + 1] = sample;
+                // Fill the sample buffer with data.
+                samples[2 * w + total] = sample;
+                samples[2 * w + 1 + total] = sample;
+            }
+
+            total += 2 * word_count;
         }
 
-        *sample_count = 2 * word_count;
+        *sample_count = total;
 
         sender.send_done();
     }
