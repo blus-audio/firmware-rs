@@ -5,6 +5,7 @@ version = "0.1.0"
 license = "GPL-3.0"
 
 [dependencies]
+fundsp = { version = "0.18.1", default-features = false }
 embassy-stm32 = { version = "0.1.0", path = "../embassy/embassy-stm32", features = [
     "defmt",
     "stm32h723vg",

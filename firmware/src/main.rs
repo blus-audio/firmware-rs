@@ -1,14 +1,18 @@
 #![no_std]
 #![no_main]
 
-use blus_fw::uac1;
+use blus_fw::uac1::{self};
 use core::cell::RefCell;
-use defmt::{panic, *};
+use defmt::{info, panic, unwrap};
 use embassy_embedded_hal::shared_bus::blocking::i2c::I2cDevice;
 use embassy_executor::Spawner;
-use embassy_futures::join::join;
+use embassy_futures::{
+    join::join,
+    select::{select, Either},
+};
 use embassy_stm32::{
-    adc, bind_interrupts,
+    adc::{self, AdcChannel},
+    bind_interrupts,
     gpio::{Input, Level, Output, Pull, Speed},
     i2c,
     mode::Async,
@@ -24,7 +28,7 @@ use embassy_sync::{
     signal::Signal,
     zerocopy_channel::{Channel, Receiver, Sender},
 };
-use embassy_time::Timer;
+use embassy_time::{Duration, Ticker, Timer};
 use embassy_usb::driver::EndpointError;
 use grounded::uninit::GroundedArrayCell;
 use static_cell::StaticCell;
@@ -36,37 +40,51 @@ bind_interrupts!(struct Irqs {
     I2C1_ER => i2c::ErrorInterruptHandler<peripherals::I2C1>;
 });
 
+const Q31_SCALING_FACTOR: f32 = 2147483648.0;
 const DMA_BUFFER_SIZE: usize = 2048;
 const USB_PACKET_SIZE: usize = 96;
-const SAMPLE_COUNT: usize = USB_PACKET_SIZE / 4 * 2;
+const SAMPLE_SIZE: usize = 4;
+const SAMPLE_COUNT: usize = USB_PACKET_SIZE / SAMPLE_SIZE;
 const SAMPLE_BLOCK_COUNT: usize = 2;
 
-static VOLUME_ADC_SIGNAL: Signal<ThreadModeRawMutex, u8> = Signal::new();
+static PLAY_SIGNAL: Signal<ThreadModeRawMutex, bool> = Signal::new();
+static VOLUME_ADC_SIGNAL: Signal<ThreadModeRawMutex, (u8, u8)> = Signal::new();
 
 static I2C_BUS: StaticCell<NoopMutex<RefCell<i2c::I2c<'static, Async>>>> = StaticCell::new();
 
-type SampleBlock = ([u32; SAMPLE_COUNT], usize);
+type SampleBlock = ([f32; SAMPLE_COUNT], usize);
+
+#[allow(unused)]
+enum SampleRate {
+    SampleRateUndefined,
+    SampleRate48000,
+    SampleRate96000,
+}
 
 // Accessible by most system masters (Zone D2)
 #[link_section = ".sram1"]
-static mut SAI1A_WRITE_BUFFER: GroundedArrayCell<u8, DMA_BUFFER_SIZE> = GroundedArrayCell::uninit();
+static mut ADC1_MEASUREMENT_BUFFER: GroundedArrayCell<u16, 1> = GroundedArrayCell::uninit();
+static mut _SAI1A_WRITE_BUFFER: GroundedArrayCell<u8, DMA_BUFFER_SIZE> = GroundedArrayCell::uninit();
 
 // Accessible by BDMA (Zone D3)
 #[link_section = ".sram4"]
 static mut SAI4A_WRITE_BUFFER: GroundedArrayCell<u32, DMA_BUFFER_SIZE> = GroundedArrayCell::uninit();
 
+#[allow(unused)]
 struct AmplifierResources {
     i2c: i2c::I2c<'static, Async>,
     pin_nsd: Output<'static>,
     pin_irqz: Input<'static>,
 }
 
-struct AdcResources {
-    adc: adc::Adc<'static, peripherals::ADC1>,
-    pin: peripherals::PA6,
+#[allow(unused)]
+struct AdcResources<T: adc::Instance> {
+    adc: adc::Adc<'static, T>,
+    pin: adc::AnyAdcChannel<T>,
     dma: peripherals::DMA1_CH0,
 }
 
+#[allow(unused)]
 struct Sai4Resources {
     sai: peripherals::SAI4,
 
@@ -79,6 +97,23 @@ struct Sai4Resources {
     sd_b: peripherals::PE11,
     fs_b: peripherals::PE13,
     dma_b: peripherals::BDMA_CH1,
+}
+
+fn clip_q63_to_q31(sample: i64) -> i32 {
+    if (sample >> 32) as i32 != (sample as i32) >> 31 {
+        info!("Clipped audio!");
+        0x7FFFFFFF ^ ((sample >> 63) as i32)
+    } else {
+        sample as i32
+    }
+}
+
+fn sample_as_u32(sample: f32) -> u32 {
+    clip_q63_to_q31((sample * Q31_SCALING_FACTOR) as i64) as u32
+}
+
+fn sample_as_f32(sample: u32) -> f32 {
+    (sample as i32 as f32) / Q31_SCALING_FACTOR
 }
 
 #[embassy_executor::task]
@@ -98,6 +133,7 @@ async fn audio_routing_task(
     fn new_sai4a<'d>(
         sai4_resources: &'d mut Sai4Resources,
         sai4a_write_buffer: &'d mut [u32],
+        sample_rate: SampleRate,
     ) -> sai::Sai<'d, peripherals::SAI4, u32> {
         let mut sai4a_config = sai::Config::default();
 
@@ -111,6 +147,12 @@ async fn audio_routing_task(
         sai4a_config.frame_length = 4 * 32;
         sai4a_config.clock_strobe = sai::ClockStrobe::Rising;
         sai4a_config.bit_order = sai::BitOrder::MsbFirst;
+
+        match sample_rate {
+            SampleRate::SampleRateUndefined => (),
+            SampleRate::SampleRate48000 => sai4a_config.master_clock_divider = sai::MasterClockDivider::Div2,
+            SampleRate::SampleRate96000 => sai4a_config.master_clock_divider = sai::MasterClockDivider::Div1,
+        }
 
         let _sai4b_config = sai::Config::default();
 
@@ -129,26 +171,59 @@ async fn audio_routing_task(
         sai4a_driver
     }
 
-    let mut sai4a_driver = new_sai4a(&mut sai4_resources, sai4a_write_buffer);
-    sai4a_driver.start();
+    let mut sai4a_driver: sai::Sai<peripherals::SAI4, u32> =
+        new_sai4a(&mut sai4_resources, sai4a_write_buffer, SampleRate::SampleRateUndefined);
+
+    const SAMPLE_RATE: SampleRate = SampleRate::SampleRate48000;
+    status_led.set_low();
+
+    let mut renew_count: usize = 0;
 
     loop {
-        // Receive a buffer from the channel
-        let (samples, sample_count) = receiver.receive().await;
+        let message_fut = PLAY_SIGNAL.wait();
+        let receive_fut = receiver.receive();
 
-        status_led.set_low();
-        sai4a_driver.set_mute(false);
+        let renew: bool = match select(message_fut, receive_fut).await {
+            Either::First(enable_playback) => {
+                if enable_playback {
+                    status_led.set_high();
+                    true
+                } else {
+                    status_led.set_low();
 
-        if let Err(_) = sai4a_driver.write(&samples[..*sample_count]).await {
+                    sai4a_driver.set_mute(true);
+                    false
+                }
+            }
+            Either::Second((samples, sample_count)) => {
+                status_led.set_high();
+
+                let mut samples_u32 = [0u32; SAMPLE_COUNT];
+                for i in 0..*sample_count {
+                    samples_u32[i] = sample_as_u32(samples[i])
+                }
+
+                let result = sai4a_driver.write(&samples_u32[..*sample_count]).await;
+
+                // Notify the channel that the buffer is now ready to be reused
+                receiver.receive_done();
+
+                if let Err(_) = result {
+                    true
+                } else {
+                    false
+                }
+            }
+        };
+
+        if renew {
+            renew_count += 1;
+            info!("Renew driver ({}).", renew_count);
+
             drop(sai4a_driver);
-            sai4a_driver = new_sai4a(&mut sai4_resources, sai4a_write_buffer);
+            sai4a_driver = new_sai4a(&mut sai4_resources, sai4a_write_buffer, SAMPLE_RATE);
             sai4a_driver.start();
-            sai4a_driver.set_mute(true);
-            status_led.set_high();
         }
-
-        // Notify the channel that the buffer is now ready to be reused
-        receiver.receive_done();
     }
 }
 
@@ -178,7 +253,7 @@ async fn amplifier_task(amplifier_resources: AmplifierResources) {
     const AMPLIFIER_LEVEL: Gain = Gain::Gain11_0dBV;
 
     let mut ic2_device_a = I2cDevice::new(i2c_bus);
-    let tas2780_a = Tas2780::new(
+    let mut tas2780_a = Tas2780::new(
         &mut ic2_device_a,
         0x39,
         0,
@@ -189,7 +264,7 @@ async fn amplifier_task(amplifier_resources: AmplifierResources) {
     );
 
     let mut ic2_device_b = I2cDevice::new(i2c_bus);
-    let tas2780_b = Tas2780::new(
+    let mut tas2780_b = Tas2780::new(
         &mut ic2_device_b,
         0x3a,
         1,
@@ -200,7 +275,7 @@ async fn amplifier_task(amplifier_resources: AmplifierResources) {
     );
 
     let mut ic2_device_c = I2cDevice::new(i2c_bus);
-    let tas2780_c = Tas2780::new(
+    let mut tas2780_c = Tas2780::new(
         &mut ic2_device_c,
         0x3d,
         2,
@@ -211,7 +286,7 @@ async fn amplifier_task(amplifier_resources: AmplifierResources) {
     );
 
     let mut ic2_device_d = I2cDevice::new(i2c_bus);
-    let tas2780_d = Tas2780::new(
+    let mut tas2780_d = Tas2780::new(
         &mut ic2_device_d,
         0x3e,
         3,
@@ -221,40 +296,79 @@ async fn amplifier_task(amplifier_resources: AmplifierResources) {
         NOISE_GATE,
     );
 
-    let mut all_amplifiers = [tas2780_a, tas2780_b, tas2780_c, tas2780_d];
-
     info!("Initialize TAS2780");
-    for amplifier in &mut all_amplifiers {
+    for amplifier in [&mut tas2780_a, &mut tas2780_b, &mut tas2780_c, &mut tas2780_d] {
         amplifier.init().await;
     }
 
     loop {
-        let attenuation_half_db = 200u8 - 2 * (VOLUME_ADC_SIGNAL.wait().await);
+        let (volume_left, volume_right) = VOLUME_ADC_SIGNAL.wait().await;
 
-        // info!("Attenuation changed to {}", attenuation_half_db);
-        for amplifier in &mut all_amplifiers {
-            amplifier.set_volume(attenuation_half_db);
+        for amplifier in [&mut tas2780_a, &mut tas2780_b] {
+            amplifier.set_volume(volume_left);
+            amplifier.enable();
+        }
+
+        for amplifier in [&mut tas2780_c, &mut tas2780_d] {
+            amplifier.set_volume(volume_right);
             amplifier.enable();
         }
     }
 }
 
 #[embassy_executor::task]
-async fn volume_control_task(mut adc_resources: AdcResources) {
-    let mut adc = adc_resources.adc;
-    adc.set_sample_time(adc::SampleTime::CYCLES810_5);
+async fn volume_control_task(
+    mut adc_resources: AdcResources<peripherals::ADC1>,
+    control_changed: uac1::ControlChanged<'static>,
+) {
+    let mut pot_ticker = Ticker::every(Duration::from_hz(1));
 
-    let mut last_measured = 0u8;
+    let adc1_measurement_buffer: &mut [u16] = unsafe {
+        ADC1_MEASUREMENT_BUFFER.initialize_all_copied(0);
+        let (ptr, len) = ADC1_MEASUREMENT_BUFFER.get_ptr_len();
+        core::slice::from_raw_parts_mut(ptr, len)
+    };
+
+    // Measure the potentiometer in intervals that are given by the ticker.
+    async fn measure(
+        ticker: &mut Ticker,
+        adc_resources: &mut AdcResources<peripherals::ADC1>,
+        measurement_buffer: &mut [u16],
+    ) -> u8 {
+        ticker.next().await;
+        adc_resources
+            .adc
+            .read(
+                &mut adc_resources.dma,
+                [(&mut adc_resources.pin, adc::SampleTime::CYCLES810_5)].into_iter(),
+                measurement_buffer,
+            )
+            .await;
+
+        let measured = (100f32 * (measurement_buffer[0] as f32) / 65535f32) as u8;
+
+        measured
+    }
+
+    // Converts a volume level in 8.8 binary signed fixpoint format to the TAS2780 representation.
+    // The TAS2780 understands volume levels from 0 (0 dB) to 0xC8 (-100 dB), where one step is 0.5 dB.
+    let volume_8q8_db_to_tas2780 = |x: i16| (-x >> 7) as u8;
 
     loop {
-        let measured = (100f32 * (adc.blocking_read(&mut adc_resources.pin) as f32) / 65535f32) as u8;
+        let control_changed_fut = control_changed.control_changed();
+        let pot_measured_fut = measure(&mut pot_ticker, &mut adc_resources, adc1_measurement_buffer);
 
-        if last_measured != measured {
-            VOLUME_ADC_SIGNAL.signal(measured);
-            last_measured = measured;
+        match select(pot_measured_fut, control_changed_fut).await {
+            Either::First(_measured) => (),
+            Either::Second(_) => {
+                let audio_channel_settings = control_changed.audio_settings();
+
+                let volume_left = volume_8q8_db_to_tas2780(audio_channel_settings.volume_8q8_db[0]);
+                let volume_right = volume_8q8_db_to_tas2780(audio_channel_settings.volume_8q8_db[1]);
+
+                VOLUME_ADC_SIGNAL.signal((volume_left, volume_right));
+            }
         }
-
-        Timer::after_secs(1).await;
     }
 }
 
@@ -287,7 +401,7 @@ async fn main(spawner: Spawner) {
             prediv: PllPreDiv::DIV4,
             mul: PllMul::MUL80,
             divp: Some(PllDiv::DIV1),  // 491.52 MHz
-            divq: Some(PllDiv::DIV80), // 12.288 MHz
+            divq: Some(PllDiv::DIV20), // 24.576 MHz for SAI4
             divr: Some(PllDiv::DIV2),  // 245.76 MHz
         });
         peripheral_config.rcc.pll3 = Some(Pll {
@@ -320,17 +434,27 @@ async fn main(spawner: Spawner) {
         led.set_low();
     }
 
-    let mut ep_out_buffer = [0u8; 1024];
-    let mut config_descriptor = [0; 256];
-    let mut bos_descriptor = [0; 256];
-    let mut control_buf = [0; 64];
-    let mut state = uac1::State::new();
+    static EP_OUT_BUFFER: StaticCell<[u8; 2 * USB_PACKET_SIZE]> = StaticCell::new();
+    let ep_out_buffer = EP_OUT_BUFFER.init([0u8; 2 * USB_PACKET_SIZE]);
+
+    static CONFIG_DESCRIPTOR: StaticCell<[u8; 256]> = StaticCell::new();
+    let config_descriptor = CONFIG_DESCRIPTOR.init([0; 256]);
+
+    static BOS_DESCRIPTOR: StaticCell<[u8; 256]> = StaticCell::new();
+    let bos_descriptor = BOS_DESCRIPTOR.init([0; 256]);
+
+    static CONTROL_BUF: StaticCell<[u8; 64]> = StaticCell::new();
+    let control_buf = CONTROL_BUF.init([0; 64]);
+
+    static STATE: StaticCell<uac1::State> = StaticCell::new();
+    let state = STATE.init(uac1::State::new());
 
     // Create the driver, from the HAL.
     let mut usb_config = usb::Config::default();
 
     // Do not enable vbus_detection with an external HS PHY.
     usb_config.vbus_detection = false;
+
     // Using a Microchip PHY requires a delay during setup.
     usb_config.xcvrdly = true;
 
@@ -350,33 +474,31 @@ async fn main(spawner: Spawner) {
         p.PB12,
         p.PB13,
         p.PB5,
-        &mut ep_out_buffer,
+        ep_out_buffer,
         usb_config,
     );
 
-    // Create embassy-usb Config
+    // Basic USB device configuration
     let mut config = embassy_usb::Config::new(0x1209, 0xaf02);
     config.manufacturer = Some("elagil");
     config.product = Some("blus-mini mk2");
-    config.serial_number = Some("123");
     config.self_powered = true;
     config.max_power = 0;
 
-    // Create embassy-usb DeviceBuilder using the driver and config.
-    // It needs some buffers for building the descriptors.
     let mut builder = embassy_usb::Builder::new(
         usb_driver,
         config,
-        &mut config_descriptor,
-        &mut bos_descriptor,
+        config_descriptor,
+        bos_descriptor,
         &mut [], // no msos descriptors
-        &mut control_buf,
+        control_buf,
     );
 
-    // Create classes on the builder.
-    let mut class = uac1::AudioClassOne::new(&mut builder, &mut state, USB_PACKET_SIZE as u16);
+    // Create classes on the builder
+    let class = uac1::AudioClassOne::new(&mut builder, state, USB_PACKET_SIZE as u16);
+    let (mut stream, control_changed) = class.split();
 
-    // Build the builder.
+    // Build and run the USB device
     let mut usb_device = builder.build();
     let usb_fut = usb_device.run();
 
@@ -409,31 +531,34 @@ async fn main(spawner: Spawner) {
 
     let adc_resources = AdcResources {
         adc: adc::Adc::new(p.ADC1),
-        pin: p.PA6,
+        pin: p.PA6.degrade_adc(),
         dma: p.DMA1_CH0,
     };
 
     static SAMPLE_BLOCKS: StaticCell<[SampleBlock; SAMPLE_BLOCK_COUNT]> = StaticCell::new();
-    let sample_blocks = SAMPLE_BLOCKS.init([([0; SAMPLE_COUNT], 0); SAMPLE_BLOCK_COUNT]);
+    let sample_blocks = SAMPLE_BLOCKS.init([([0.0; SAMPLE_COUNT], 0); SAMPLE_BLOCK_COUNT]);
 
     static CHANNEL: StaticCell<Channel<'_, NoopRawMutex, SampleBlock>> = StaticCell::new();
     let channel = CHANNEL.init(Channel::new(sample_blocks));
     let (mut sender, receiver) = channel.split();
 
-    // Create PR
     // let mut tim_2 = timer::low_level::Timer::new(p.TIM2);
     // tim_2.set_trigger_source(timer::low_level::TriggerSource::ITR5);
 
     unwrap!(spawner.spawn(heartbeat_task(led_red)));
     unwrap!(spawner.spawn(audio_routing_task(sai4_resources, receiver, led_blue)));
-    unwrap!(spawner.spawn(volume_control_task(adc_resources)));
+    unwrap!(spawner.spawn(volume_control_task(adc_resources, control_changed)));
     unwrap!(spawner.spawn(amplifier_task(amplifier_resources)));
 
     let receive_fut = async {
         loop {
-            class.wait_connection().await;
+            stream.wait_connection().await;
             info!("Connected");
-            let _ = receive(&mut class, &mut sender).await;
+
+            PLAY_SIGNAL.signal(true);
+            let _ = receive(&mut stream, &mut sender).await;
+            PLAY_SIGNAL.signal(false);
+
             info!("Disconnected");
         }
     };
@@ -454,7 +579,7 @@ impl From<EndpointError> for Disconnected {
 }
 
 async fn receive<'d, T: usb::Instance + 'd>(
-    class: &mut uac1::AudioClassOne<'d, usb::Driver<'d, T>>,
+    stream: &mut uac1::Stream<'d, usb::Driver<'d, T>>,
     sender: &mut Sender<'static, NoopRawMutex, SampleBlock>,
 ) -> Result<(), Disconnected> {
     loop {
@@ -463,21 +588,25 @@ async fn receive<'d, T: usb::Instance + 'd>(
 
         let mut usb_data = [0u8; USB_PACKET_SIZE];
 
-        let data_size = class.read_packet(&mut usb_data).await?;
-        let word_count = data_size / 4;
+        let data_size = stream.read_packet(&mut usb_data).await?;
+        let word_count = data_size / SAMPLE_SIZE;
 
-        for w in 0..word_count {
-            let sample: u32 = (usb_data[4 * w] as u32)
-                | (usb_data[4 * w + 1] as u32) << 8
-                | (usb_data[4 * w + 2] as u32) << 16
-                | (usb_data[4 * w + 3] as u32) << 24;
+        if word_count * SAMPLE_SIZE == data_size {
+            for w in 0..word_count {
+                let byte_offset = w * SAMPLE_SIZE;
+                let sample = sample_as_f32(u32::from_le_bytes(
+                    usb_data[byte_offset..byte_offset + SAMPLE_SIZE].try_into().unwrap(),
+                ));
 
-            // Fill the sample buffer with data.
-            samples[2 * w] = sample;
-            samples[2 * w + 1] = sample;
+                // Fill the sample buffer with data.
+                samples[2 * w] = sample;
+                samples[2 * w + 1] = sample;
+            }
+
+            *sample_count = 2 * word_count;
+        } else {
+            info!("Invalid USB buffer size of {}, skipped.", data_size);
         }
-
-        *sample_count = 2 * word_count;
 
         sender.send_done();
     }
