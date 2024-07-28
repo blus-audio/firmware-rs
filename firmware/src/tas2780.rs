@@ -6,6 +6,9 @@ use embedded_hal_1::i2c;
 type RegisterAddress = u8;
 type RegisterValue = u8;
 
+/// The volume at which the amplifier is muted
+pub const MUTE_VOLUME: u8 = 0xFF;
+
 /// The currently active page
 const PAGE_REGISTER: RegisterAddress = 0x00;
 
@@ -265,31 +268,30 @@ where
         self.set_page(0x00);
 
         let mut tdm_cfg2: RegisterValue = 0x00;
+        tdm_cfg2 |= 0b10 << 0; // RX_SLEN: 32 bit
+        tdm_cfg2 |= 0b11 << 2; // RX_WLEN: 32 bit
+
         let mut tdm_cfg3: RegisterValue = 0x00;
 
         match self.channel {
             Channel::Left => {
-                tdm_cfg2 |= 0b01 << 4;
+                tdm_cfg2 |= 0b01 << 4; // RX_SCFG: Mono left channel
                 tdm_cfg3 |= self.tdm_slot
             }
             Channel::Right => {
-                tdm_cfg2 |= 0b10 << 4;
+                tdm_cfg2 |= 0b10 << 4; // RX_SCFG: Mono right channel
                 tdm_cfg3 |= self.tdm_slot << 4
             }
             Channel::StereoMix => {
-                tdm_cfg2 |= 0b11 << 4;
+                tdm_cfg2 |= 0b11 << 4; // RX_SCFG: Stereo downmix (L+R)/2
                 tdm_cfg3 |= 0x01 << 4 | 0x00 << 0
             }
         }
 
-        tdm_cfg2 |= 0b11 << 2; // RX_WLEN: 32 bit
-        tdm_cfg2 |= 0b10 << 0; // RX_SLEN: 32 bit
-
         let tdm_cfg1 = 0; // RX_OFFSET = 0
         self.write_register(0x09, tdm_cfg1);
-
         self.write_register(0x0A, tdm_cfg2);
-        self.write_register(0x0B, tdm_cfg3);
+        self.write_register(0x0C, tdm_cfg3);
 
         // Set up the noise gate, if enabled
         if let Some(noise_gate) = self.noise_gate {

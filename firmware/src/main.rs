@@ -1,7 +1,9 @@
 #![no_std]
 #![no_main]
 
+use biquad::ToHertz;
 use blus_fw::uac1::{self};
+use blus_fw::{filters, tas2780};
 use core::cell::RefCell;
 use defmt::{info, panic, unwrap};
 use embassy_embedded_hal::shared_bus::blocking::i2c::I2cDevice;
@@ -51,6 +53,7 @@ static PLAY_SIGNAL: Signal<ThreadModeRawMutex, bool> = Signal::new();
 static VOLUME_ADC_SIGNAL: Signal<ThreadModeRawMutex, (u8, u8)> = Signal::new();
 
 static I2C_BUS: StaticCell<NoopMutex<RefCell<i2c::I2c<'static, Async>>>> = StaticCell::new();
+static FILTERS: StaticCell<filters::Filters> = StaticCell::new();
 
 type SampleBlock = ([f32; SAMPLE_COUNT], usize);
 
@@ -177,6 +180,7 @@ async fn audio_routing_task(
     const SAMPLE_RATE: SampleRate = SampleRate::SampleRate48000;
     status_led.set_low();
 
+    let filters = FILTERS.init(filters::Filters::new(48.khz()));
     let mut renew_count: usize = 0;
 
     loop {
@@ -198,12 +202,28 @@ async fn audio_routing_task(
             Either::Second((samples, sample_count)) => {
                 status_led.set_high();
 
-                let mut samples_u32 = [0u32; SAMPLE_COUNT];
-                for i in 0..*sample_count {
-                    samples_u32[i] = sample_as_u32(samples[i])
+                let mut samples_u32 = [0u32; 2 * SAMPLE_COUNT];
+                for i in 0..*sample_count / 2 {
+                    let sample_left = samples[2 * i];
+                    let sample_right = samples[2 * i + 1];
+
+                    let mut sample_a = sample_left;
+                    let mut sample_b = sample_left;
+                    let mut sample_c = sample_right;
+                    let mut sample_d = sample_right;
+
+                    sample_a = filters::run_filters(sample_a, &mut filters.biquads_a, filters.gain_a);
+                    sample_b = filters::run_filters(sample_b, &mut filters.biquads_b, filters.gain_b);
+                    sample_c = filters::run_filters(sample_c, &mut filters.biquads_c, filters.gain_c);
+                    sample_d = filters::run_filters(sample_d, &mut filters.biquads_d, filters.gain_d);
+
+                    samples_u32[4 * i + 0] = sample_as_u32(sample_a);
+                    samples_u32[4 * i + 1] = sample_as_u32(sample_b);
+                    samples_u32[4 * i + 2] = sample_as_u32(sample_c);
+                    samples_u32[4 * i + 3] = sample_as_u32(sample_d);
                 }
 
-                let result = sai4a_driver.write(&samples_u32[..*sample_count]).await;
+                let result = sai4a_driver.write(&samples_u32[..*sample_count * 2]).await;
 
                 // Notify the channel that the buffer is now ready to be reused
                 receiver.receive_done();
@@ -279,7 +299,7 @@ async fn amplifier_task(amplifier_resources: AmplifierResources) {
         &mut ic2_device_c,
         0x3d,
         2,
-        Channel::Left,
+        Channel::Right,
         AMPLIFIER_LEVEL,
         POWER_MODE,
         NOISE_GATE,
@@ -290,7 +310,7 @@ async fn amplifier_task(amplifier_resources: AmplifierResources) {
         &mut ic2_device_d,
         0x3e,
         3,
-        Channel::Left,
+        Channel::Right,
         AMPLIFIER_LEVEL,
         POWER_MODE,
         NOISE_GATE,
@@ -350,9 +370,9 @@ async fn volume_control_task(
         measured
     }
 
-    // Converts a volume level in 8.8 binary signed fixpoint format to the TAS2780 representation.
+    // Converts an attenuation level in 8.8 binary signed fixpoint format to the TAS2780 representation.
     // The TAS2780 understands volume levels from 0 (0 dB) to 0xC8 (-100 dB), where one step is 0.5 dB.
-    let volume_8q8_db_to_tas2780 = |x: i16| (-x >> 7) as u8;
+    let attenuation_8q8_db_to_tas2780 = |x: i16| (-x >> 7) as u8;
 
     loop {
         let control_changed_fut = control_changed.control_changed();
@@ -363,8 +383,19 @@ async fn volume_control_task(
             Either::Second(_) => {
                 let audio_channel_settings = control_changed.audio_settings();
 
-                let volume_left = volume_8q8_db_to_tas2780(audio_channel_settings.volume_8q8_db[0]);
-                let volume_right = volume_8q8_db_to_tas2780(audio_channel_settings.volume_8q8_db[1]);
+                let volume_left: u8;
+                if audio_channel_settings.is_muted[0] {
+                    volume_left = tas2780::MUTE_VOLUME;
+                } else {
+                    volume_left = attenuation_8q8_db_to_tas2780(audio_channel_settings.volume_8q8_db[0]);
+                }
+
+                let volume_right: u8;
+                if audio_channel_settings.is_muted[0] {
+                    volume_right = tas2780::MUTE_VOLUME;
+                } else {
+                    volume_right = attenuation_8q8_db_to_tas2780(audio_channel_settings.volume_8q8_db[0]);
+                }
 
                 VOLUME_ADC_SIGNAL.signal((volume_left, volume_right));
             }
@@ -583,15 +614,23 @@ async fn receive<'d, T: usb::Instance + 'd>(
     sender: &mut Sender<'static, NoopRawMutex, SampleBlock>,
 ) -> Result<(), Disconnected> {
     loop {
-        // Obtain a free buffer from the channel
-        let (samples, sample_count) = sender.send().await;
-
         let mut usb_data = [0u8; USB_PACKET_SIZE];
 
+        // let feedback_value: u32 = 786432 >> 3; // Ideal for 48 kHz, in 10uq14 format.
+        // stream
+        //     .write_packet(&[
+        //         feedback_value as u8,
+        //         (feedback_value >> 8) as u8,
+        //         (feedback_value >> 16) as u8,
+        //     ])
+        //     .await?;
         let data_size = stream.read_packet(&mut usb_data).await?;
         let word_count = data_size / SAMPLE_SIZE;
 
         if word_count * SAMPLE_SIZE == data_size {
+            // Obtain a free buffer from the channel
+            let (samples, sample_count) = sender.send().await;
+
             for w in 0..word_count {
                 let byte_offset = w * SAMPLE_SIZE;
                 let sample = sample_as_f32(u32::from_le_bytes(
@@ -599,15 +638,14 @@ async fn receive<'d, T: usb::Instance + 'd>(
                 ));
 
                 // Fill the sample buffer with data.
-                samples[2 * w] = sample;
-                samples[2 * w + 1] = sample;
+                samples[w] = sample;
             }
 
-            *sample_count = 2 * word_count;
+            *sample_count = word_count;
+
+            sender.send_done();
         } else {
             info!("Invalid USB buffer size of {}, skipped.", data_size);
         }
-
-        sender.send_done();
     }
 }

@@ -9,7 +9,7 @@ use core::future::poll_fn;
 use core::mem::MaybeUninit;
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use core::task::Poll;
-use defmt::*;
+use defmt::trace;
 use embassy_sync::blocking_mutex::CriticalSectionMutex;
 use embassy_sync::waitqueue::WakerRegistration;
 use embassy_usb::control::{self, InResponse, OutResponse, Recipient, Request, RequestType};
@@ -136,7 +136,7 @@ impl<'d, D: Driver<'d>> AudioClassOne<'d, D> {
         ];
 
         // Class-specific AC Interface Descriptor [UAC 4.3.2]
-        let total_length = 125;
+        let total_length = 122;
 
         // FIXME: Calculate the length.
         // (2 + input_terminal_descriptor.len())
@@ -188,13 +188,10 @@ impl<'d, D: Driver<'d>> AudioClassOne<'d, D> {
                 AUDIO_CHANNEL_COUNT as u8, // bNrChannels.
                 4u8,                       // bSubframeSize. 32 bit.
                 32u8,                      // bBitResolution.
-                0x02,                      // bSamFreqType (discrete).
+                0x01,                      // bSamFreqType (discrete).
                 (48000 & 0xFF) as u8,
                 ((48000 >> 8) & 0xFF) as u8,
                 ((48000 >> 16) & 0xFF) as u8, // Audio sampling frequency, 48 kHz.
-                (96000 & 0xFF) as u8,
-                ((96000 >> 8) & 0xFF) as u8,
-                ((96000 >> 16) & 0xFF) as u8, // Audio sampling frequency, 96 kHz.
             ],
         );
 
@@ -273,12 +270,8 @@ impl<'d, D: Driver<'d>> AudioClassOne<'d, D> {
 #[derive(Clone, Copy, Debug)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct AudioSettings {
-    /// The master channel mute state.
-    pub master_is_muted: bool,
     /// Channel mute states.
     pub is_muted: [bool; AUDIO_CHANNEL_COUNT],
-    /// The master channel volume level in 8.8 format (in dB).
-    pub master_volume_8q8_db: i16,
     /// Channel volume levels in 8.8 format (in dB).
     pub volume_8q8_db: [i16; AUDIO_CHANNEL_COUNT],
 }
@@ -286,9 +279,7 @@ pub struct AudioSettings {
 impl Default for AudioSettings {
     fn default() -> Self {
         AudioSettings {
-            master_is_muted: false,
-            is_muted: [false; AUDIO_CHANNEL_COUNT],
-            master_volume_8q8_db: 0,
+            is_muted: [true; AUDIO_CHANNEL_COUNT],
             volume_8q8_db: [0; AUDIO_CHANNEL_COUNT],
         }
     }
@@ -408,19 +399,16 @@ impl<'a> Control<'a> {
         let mute_state = data[0] != 0;
 
         match channel_index as usize {
-            0 => {
-                audio_settings.master_is_muted = mute_state;
-            }
             1..=AUDIO_CHANNEL_COUNT => {
                 audio_settings.is_muted[channel_index as usize - 1] = mute_state;
             }
             _ => {
-                info!("Failed to set channel {} mute state: {}", channel_index, mute_state);
+                trace!("Failed to set channel {} mute state: {}", channel_index, mute_state);
                 return OutResponse::Rejected;
             }
         }
 
-        info!("Set channel {} mute state: {}", channel_index, mute_state);
+        trace!("Set channel {} mute state: {}", channel_index, mute_state);
         OutResponse::Accepted
     }
 
@@ -433,19 +421,16 @@ impl<'a> Control<'a> {
         let volume = i16::from_ne_bytes(data[..2].try_into().expect("Failed to read volume."));
 
         match channel_index as usize {
-            0 => {
-                audio_settings.master_volume_8q8_db = volume;
-            }
             1..=AUDIO_CHANNEL_COUNT => {
                 audio_settings.volume_8q8_db[channel_index as usize - 1] = volume;
             }
             _ => {
-                info!("Failed to set channel {} volume: {}", channel_index, volume);
+                trace!("Failed to set channel {} volume: {}", channel_index, volume);
                 return OutResponse::Rejected;
             }
         }
 
-        info!("Set channel {} volume: {}", channel_index, volume);
+        trace!("Set channel {} volume: {}", channel_index, volume);
         OutResponse::Accepted
     }
 
@@ -456,12 +441,12 @@ impl<'a> Control<'a> {
         let control_unit = (req.value >> 8) as u8;
 
         if interface_index != self.control_interface.into() {
-            info!("Unhandled interface set request for interface {}", interface_index);
+            trace!("Unhandled interface set request for interface {}", interface_index);
             return None;
         }
 
         if entity_index != FEATURE_UNIT_ID {
-            info!("Unsupported interface set request for entity {}", entity_index);
+            trace!("Unsupported interface set request for entity {}", entity_index);
             return Some(OutResponse::Rejected);
         }
 
@@ -493,15 +478,17 @@ impl<'a> Control<'a> {
         let endpoint_address = req.index as u8;
 
         if endpoint_address != self.streaming_endpoint_address {
-            info!(
+            trace!(
                 "Unhandled endpoint set request for endpoint {} and control {} with data {}",
-                endpoint_address, control_selector, data
+                endpoint_address,
+                control_selector,
+                data
             );
             return None;
         }
 
         if control_selector != SAMPLING_FREQ_CONTROL {
-            info!(
+            trace!(
                 "Unsupported endpoint set request for control selector {}",
                 control_selector
             );
@@ -510,7 +497,7 @@ impl<'a> Control<'a> {
 
         let sample_rate_hz: u32 = (data[0] as u32) | (data[1] as u32) << 8 | (data[2] as u32) << 16;
         self.shared().sample_rate_hz.store(sample_rate_hz, Ordering::Relaxed);
-        info!("Set endpoint {} sample rate to {} Hz", endpoint_address, sample_rate_hz);
+        trace!("Set endpoint {} sample rate to {} Hz", endpoint_address, sample_rate_hz);
 
         Some(OutResponse::Accepted)
     }
@@ -522,13 +509,13 @@ impl<'a> Control<'a> {
         let control_unit = (req.value >> 8) as u8;
 
         if interface_index != self.control_interface.into() {
-            info!("Unhandled interface get request for interface {}.", interface_index);
+            trace!("Unhandled interface get request for interface {}.", interface_index);
             return None;
         }
 
         if entity_index != FEATURE_UNIT_ID {
             // Only this function unit can be handled at the moment.
-            info!("Unsupported interface get request for entity {}.", entity_index);
+            trace!("Unsupported interface get request for entity {}.", entity_index);
             return Some(InResponse::Rejected);
         }
 
@@ -540,7 +527,6 @@ impl<'a> Control<'a> {
                     let volume: i16;
 
                     match channel_index as usize {
-                        0 => volume = audio_settings.master_volume_8q8_db,
                         1..=AUDIO_CHANNEL_COUNT => volume = audio_settings.volume_8q8_db[channel_index as usize - 1],
                         _ => return Some(InResponse::Rejected),
                     }
@@ -548,20 +534,19 @@ impl<'a> Control<'a> {
                     buf[0] = volume as u8;
                     buf[1] = (volume >> 8) as u8;
 
-                    info!("Got channel {} volume: {}.", channel_index, volume);
+                    trace!("Got channel {} volume: {}.", channel_index, volume);
                     return Some(InResponse::Accepted(&buf[..2]));
                 }
                 MUTE_CONTROL => {
                     let mute_state: bool;
 
                     match channel_index as usize {
-                        0 => mute_state = audio_settings.master_is_muted,
                         1..=AUDIO_CHANNEL_COUNT => mute_state = audio_settings.is_muted[channel_index as usize - 1],
                         _ => return Some(InResponse::Rejected),
                     }
 
                     buf[0] = mute_state.into();
-                    info!("Got channel {} mute state: {}.", channel_index, mute_state);
+                    trace!("Got channel {} mute state: {}.", channel_index, mute_state);
                     return Some(InResponse::Accepted(&buf[..1]));
                 }
                 _ => return Some(InResponse::Rejected),
@@ -601,12 +586,12 @@ impl<'a> Control<'a> {
         let endpoint_address = req.index as u8;
 
         if endpoint_address != self.streaming_endpoint_address {
-            info!("Unhandled endpoint get request for endpoint {}.", endpoint_address);
+            trace!("Unhandled endpoint get request for endpoint {}.", endpoint_address);
             return None;
         }
 
         if control_selector != SAMPLING_FREQ_CONTROL as u8 {
-            info!(
+            trace!(
                 "Unsupported endpoint get request for control selector {}.",
                 control_selector
             );
@@ -630,6 +615,13 @@ impl<'d> Handler for Control<'d> {
 
         shared.changed.store(true, Ordering::Relaxed);
         shared.waker.borrow_mut().wake();
+    }
+
+    // Suspend occurs, for example, when disconnecting the USB cable.
+    fn suspended(&mut self, suspended: bool) {
+        if suspended {
+            self.reset()
+        }
     }
 
     // Handle control set requests.
