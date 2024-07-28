@@ -33,6 +33,7 @@ use embassy_sync::{
 use embassy_time::{Duration, Ticker, Timer};
 use embassy_usb::driver::EndpointError;
 use grounded::uninit::GroundedArrayCell;
+use heapless::Vec;
 use static_cell::StaticCell;
 use {defmt_rtt as _, panic_probe as _};
 
@@ -43,7 +44,7 @@ bind_interrupts!(struct Irqs {
 });
 
 const Q31_SCALING_FACTOR: f32 = 2147483648.0;
-const DMA_BUFFER_SIZE: usize = 2048;
+const DMA_BUFFER_SIZE: usize = 1024;
 const USB_PACKET_SIZE: usize = 96;
 const SAMPLE_SIZE: usize = 4;
 const SAMPLE_COUNT: usize = USB_PACKET_SIZE / SAMPLE_SIZE;
@@ -61,7 +62,6 @@ type SampleBlock = ([f32; SAMPLE_COUNT], usize);
 enum SampleRate {
     SampleRateUndefined,
     SampleRate48000,
-    SampleRate96000,
 }
 
 // Accessible by most system masters (Zone D2)
@@ -143,7 +143,6 @@ async fn audio_routing_task(
         sai4a_config.slot_count = sai::word::U4(4);
         sai4a_config.slot_enable = 0xFFFF; // All slots
         sai4a_config.data_size = sai::DataSize::Data32;
-        // sai4a_config.fifo_threshold = sai::FifoThreshold::Half;
         sai4a_config.frame_sync_offset = sai::FrameSyncOffset::OnFirstBit;
         sai4a_config.frame_sync_active_level_length = sai::word::U7(1);
         sai4a_config.frame_sync_definition = sai::FrameSyncDefinition::StartOfFrame;
@@ -154,7 +153,6 @@ async fn audio_routing_task(
         match sample_rate {
             SampleRate::SampleRateUndefined => (),
             SampleRate::SampleRate48000 => sai4a_config.master_clock_divider = sai::MasterClockDivider::Div2,
-            SampleRate::SampleRate96000 => sai4a_config.master_clock_divider = sai::MasterClockDivider::Div1,
         }
 
         let _sai4b_config = sai::Config::default();
@@ -174,75 +172,57 @@ async fn audio_routing_task(
         sai4a_driver
     }
 
-    let mut sai4a_driver: sai::Sai<peripherals::SAI4, u32> =
-        new_sai4a(&mut sai4_resources, sai4a_write_buffer, SampleRate::SampleRateUndefined);
-
     const SAMPLE_RATE: SampleRate = SampleRate::SampleRate48000;
+    let mut sai4a_driver = new_sai4a(&mut sai4_resources, sai4a_write_buffer, SAMPLE_RATE);
+    sai4a_driver.start();
+
     status_led.set_low();
 
     let filters = FILTERS.init(filters::Filters::new(48.khz()));
-    let mut renew_count: usize = 0;
 
     loop {
-        let message_fut = PLAY_SIGNAL.wait();
-        let receive_fut = receiver.receive();
+        let (samples, sample_count) = receiver.receive().await;
 
-        let renew: bool = match select(message_fut, receive_fut).await {
-            Either::First(enable_playback) => {
-                if enable_playback {
-                    status_led.set_high();
-                    true
-                } else {
-                    status_led.set_low();
+        let mut samples_u32: Vec<u32, { 2 * SAMPLE_COUNT }> = Vec::new();
 
-                    sai4a_driver.set_mute(true);
-                    false
-                }
-            }
-            Either::Second((samples, sample_count)) => {
-                status_led.set_high();
+        status_led.set_high();
 
-                let mut samples_u32 = [0u32; 2 * SAMPLE_COUNT];
-                for i in 0..*sample_count / 2 {
-                    let sample_left = samples[2 * i];
-                    let sample_right = samples[2 * i + 1];
+        for index in 0..*sample_count / 2 {
+            let sample_left = samples[2 * index];
+            let sample_right = samples[2 * index + 1];
 
-                    let mut sample_a = sample_left;
-                    let mut sample_b = sample_left;
-                    let mut sample_c = sample_right;
-                    let mut sample_d = sample_right;
+            let mut sample_a = sample_left;
+            let mut sample_b = sample_left;
+            let mut sample_c = sample_right;
+            let mut sample_d = sample_right;
 
-                    sample_a = filters::run_filters(sample_a, &mut filters.biquads_a, filters.gain_a);
-                    sample_b = filters::run_filters(sample_b, &mut filters.biquads_b, filters.gain_b);
-                    sample_c = filters::run_filters(sample_c, &mut filters.biquads_c, filters.gain_c);
-                    sample_d = filters::run_filters(sample_d, &mut filters.biquads_d, filters.gain_d);
+            sample_a = filters::run_filters(sample_a, &mut filters.biquads_a, filters.gain_a);
+            sample_b = filters::run_filters(sample_b, &mut filters.biquads_b, filters.gain_b);
+            sample_c = filters::run_filters(sample_c, &mut filters.biquads_c, filters.gain_c);
+            sample_d = filters::run_filters(sample_d, &mut filters.biquads_d, filters.gain_d);
 
-                    samples_u32[4 * i + 0] = sample_as_u32(sample_a);
-                    samples_u32[4 * i + 1] = sample_as_u32(sample_b);
-                    samples_u32[4 * i + 2] = sample_as_u32(sample_c);
-                    samples_u32[4 * i + 3] = sample_as_u32(sample_d);
-                }
+            samples_u32.push(sample_as_u32(sample_a)).unwrap();
+            samples_u32.push(sample_as_u32(sample_b)).unwrap();
+            samples_u32.push(sample_as_u32(sample_c)).unwrap();
+            samples_u32.push(sample_as_u32(sample_d)).unwrap();
+        }
 
-                let result = sai4a_driver.write(&samples_u32[..*sample_count * 2]).await;
+        status_led.set_low();
 
-                // Notify the channel that the buffer is now ready to be reused
-                receiver.receive_done();
+        let result = sai4a_driver.write(&samples_u32[..*sample_count * 2]).await;
 
-                if let Err(_) = result {
-                    true
-                } else {
-                    false
-                }
-            }
-        };
+        // Notify the channel that the buffer is now ready to be reused
+        receiver.receive_done();
 
-        if renew {
-            renew_count += 1;
-            info!("Renew driver ({}).", renew_count);
+        if let Err(_) = result {
+            PLAY_SIGNAL.signal(false);
+            info!("Renew SAI setup.");
 
             drop(sai4a_driver);
             sai4a_driver = new_sai4a(&mut sai4_resources, sai4a_write_buffer, SAMPLE_RATE);
             sai4a_driver.start();
+
+            PLAY_SIGNAL.signal(true);
         }
     }
 }
@@ -322,16 +302,28 @@ async fn amplifier_task(amplifier_resources: AmplifierResources) {
     }
 
     loop {
-        let (volume_left, volume_right) = VOLUME_ADC_SIGNAL.wait().await;
+        let play_fut = PLAY_SIGNAL.wait();
+        let volume_fut = VOLUME_ADC_SIGNAL.wait();
 
-        for amplifier in [&mut tas2780_a, &mut tas2780_b] {
-            amplifier.set_volume(volume_left);
-            amplifier.enable();
-        }
+        match select(play_fut, volume_fut).await {
+            Either::First(play) => {
+                if play {
+                    for amplifier in [&mut tas2780_a, &mut tas2780_b, &mut tas2780_c, &mut tas2780_d] {
+                        amplifier.enable();
+                    }
+                } else {
+                    // FIXME: Implement disable?
+                }
+            }
+            Either::Second((volume_left, volume_right)) => {
+                for amplifier in [&mut tas2780_a, &mut tas2780_b] {
+                    amplifier.set_volume(volume_left);
+                }
 
-        for amplifier in [&mut tas2780_c, &mut tas2780_d] {
-            amplifier.set_volume(volume_right);
-            amplifier.enable();
+                for amplifier in [&mut tas2780_c, &mut tas2780_d] {
+                    amplifier.set_volume(volume_right);
+                }
+            }
         }
     }
 }
@@ -340,6 +332,7 @@ async fn amplifier_task(amplifier_resources: AmplifierResources) {
 async fn volume_control_task(
     mut adc_resources: AdcResources<peripherals::ADC1>,
     control_changed: uac1::ControlChanged<'static>,
+    mut status_led: Output<'static>,
 ) {
     let mut pot_ticker = Ticker::every(Duration::from_hz(1));
 
@@ -381,6 +374,7 @@ async fn volume_control_task(
         match select(pot_measured_fut, control_changed_fut).await {
             Either::First(_measured) => (),
             Either::Second(_) => {
+                status_led.set_high();
                 let audio_channel_settings = control_changed.audio_settings();
 
                 let volume_left: u8;
@@ -398,6 +392,10 @@ async fn volume_control_task(
                 }
 
                 VOLUME_ADC_SIGNAL.signal((volume_left, volume_right));
+
+                // Limit the rate of volume updates
+                Timer::after_millis(100).await;
+                status_led.set_low();
             }
         }
     }
@@ -407,10 +405,10 @@ async fn volume_control_task(
 async fn heartbeat_task(mut status_led: Output<'static>) {
     loop {
         status_led.set_high();
-        Timer::after_millis(1000).await;
+        Timer::after_millis(100).await;
 
         status_led.set_low();
-        Timer::after_millis(1000).await;
+        Timer::after_secs(2).await;
     }
 }
 
@@ -578,18 +576,14 @@ async fn main(spawner: Spawner) {
 
     unwrap!(spawner.spawn(heartbeat_task(led_red)));
     unwrap!(spawner.spawn(audio_routing_task(sai4_resources, receiver, led_blue)));
-    unwrap!(spawner.spawn(volume_control_task(adc_resources, control_changed)));
+    unwrap!(spawner.spawn(volume_control_task(adc_resources, control_changed, led_yellow)));
     unwrap!(spawner.spawn(amplifier_task(amplifier_resources)));
 
     let receive_fut = async {
         loop {
             stream.wait_connection().await;
             info!("Connected");
-
-            PLAY_SIGNAL.signal(true);
             let _ = receive(&mut stream, &mut sender).await;
-            PLAY_SIGNAL.signal(false);
-
             info!("Disconnected");
         }
     };
@@ -616,12 +610,13 @@ async fn receive<'d, T: usb::Instance + 'd>(
     loop {
         let mut usb_data = [0u8; USB_PACKET_SIZE];
 
-        // let feedback_value: u32 = 786432 >> 3; // Ideal for 48 kHz, in 10uq14 format.
+        // let feedback_value: u32 = 393216; // Ideal for 48 kHz, in 16uq16 kHz format?
         // stream
         //     .write_packet(&[
         //         feedback_value as u8,
         //         (feedback_value >> 8) as u8,
         //         (feedback_value >> 16) as u8,
+        //         (feedback_value >> 24) as u8,
         //     ])
         //     .await?;
         let data_size = stream.read_packet(&mut usb_data).await?;
