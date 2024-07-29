@@ -1,9 +1,10 @@
-//! USB Audio class
+//! USB Audio Class 1.0
 //!
 //! This crate provides a USB device class based on "Universal Serial Bus Device
 //! Class Definition for Audio Devices", Release 1.0.
+//!
+//! Currently, only a single output streaming interface supported (implementation of a speaker).
 use class_codes::*;
-
 use core::cell::{Cell, RefCell};
 use core::future::poll_fn;
 use core::mem::MaybeUninit;
@@ -17,6 +18,7 @@ use embassy_usb::descriptor::{SynchronizationType, UsageType};
 use embassy_usb::driver::{Driver, Endpoint, EndpointError, EndpointIn, EndpointOut, EndpointType};
 use embassy_usb::types::InterfaceNumber;
 use embassy_usb::{Builder, Handler};
+use heapless::Vec;
 
 mod terminal_type;
 pub use terminal_type::TerminalType;
@@ -26,8 +28,12 @@ pub use channel_config::ChannelConfig;
 
 mod class_codes;
 
-/// The number of audio channels (e.g. 2 for left+right)
-const AUDIO_CHANNEL_COUNT: usize = 2;
+/// The maximum number of supported audio channels
+/// FIXME: Use `core::mem::variant_count(...)` when stabilized.
+const MAX_AUDIO_CHANNEL_COUNT: usize = 12;
+
+/// Maximum allowed sampling rate (3 bytes) in Hz.
+const MAX_SAMPLE_RATE_HZ: u32 = 0x7FFFFF;
 
 /// Arbitrary unique identifier for the input unit
 const INPUT_UNIT_ID: u8 = 0x01;
@@ -44,7 +50,10 @@ const VOLUME_STEPS_PER_DB: i16 = 256;
 const MIN_VOLUME_DB: i16 = -100;
 const MAX_VOLUME_DB: i16 = 0;
 
-/// Internal state for USB Audio
+// Maximum number of supported discrete sample rates.
+const MAX_SAMPLE_RATE_COUNT: usize = 10;
+
+/// Internal state for the USB Audio Class
 pub struct State<'a> {
     control: MaybeUninit<Control<'a>>,
     shared: SharedControl,
@@ -66,17 +75,62 @@ impl<'a> State<'a> {
     }
 }
 
-pub struct AudioClassOne<'d, D: Driver<'d>> {
+/// Feedback bRefresh [UAC 3.7.2.2]
+///
+/// From the specification: "A new Ff value is available every 2^(10 – P) frames with P ranging from 1 to 9. The
+/// bRefresh field of the synch standard endpoint descriptor is used to report the exponent (10-P) to the Host.
+/// It can range from 9 down to 1. (512 ms down to 2 ms)"
+#[repr(u8)]
+pub enum FeedbackRefreshPeriod {
+    Period2ms = 1,
+    Period4ms = 2,
+    Period8ms = 3,
+    Period16ms = 4,
+    Period32ms = 5,
+    Period64ms = 6,
+    Period128ms = 7,
+    Period256ms = 8,
+    Period512ms = 9,
+}
+
+impl From<FeedbackRefreshPeriod> for u8 {
+    fn from(p: FeedbackRefreshPeriod) -> u8 {
+        p as u8
+    }
+}
+
+pub struct Uac1<'d, D: Driver<'d>> {
     streaming_endpoint: D::EndpointOut,
     feedback_endpoint: D::EndpointIn,
     control: &'d SharedControl,
 }
 
-impl<'d, D: Driver<'d>> AudioClassOne<'d, D> {
-    /// Creates a new `AudioClassOne` with the provided UsbBus, state, and `max_packet_size` in bytes.
+impl<'d, D: Driver<'d>> Uac1<'d, D> {
+    /// Creates a new `Uac1` (USB audio class 1.0).
+    ///
+    /// The packet size should be chosen, based on the expected transfer size of samples per (micro)frame.
+    /// For example, a stereo stream at 32 bit resolution and 48 kHz sample rate yields packets of 384 byte for
+    /// full-speed USB (1 ms frame interval) or 48 byte for high-speed USB (125 us microframe interval).
+    /// When using feedback, the packet size varies and thus, the `max_packet_size` should be increased (e.g. to double).
     ///
     /// Use `split` afterwards, in order to option the usable `Stream` and `ControlChanged` instances.
-    pub fn new(builder: &mut Builder<'d, D>, state: &'d mut State<'d>, max_packet_size: u16) -> Self {
+    ///
+    /// # Arguments
+    ///
+    /// * `builder` - The builder for the class.
+    /// * `state` - The internal state of the class.
+    /// * `max_packet_size` - The maximum packet size per (micro)frame.
+    /// * `sample_rates_hz` - The supported sample rates in Hz.
+    /// * `audio_channels` - The advertised audio channels (up to 12). Entries must be unique, or this function panics.
+    /// * `feedback_refresh_period` - The refresh period for the feedback value.
+    pub fn new(
+        builder: &mut Builder<'d, D>,
+        state: &'d mut State<'d>,
+        max_packet_size: u16,
+        sample_rates_hz: &[u32],
+        audio_channels: &[ChannelConfig],
+        feedback_refresh_period: FeedbackRefreshPeriod,
+    ) -> Self {
         let mut func = builder.function(AUDIO_FUNCTION, FUNCTION_SUBCLASS_UNDEFINED, PROTOCOL_NONE);
 
         // Audio control interface (mandatory) [UAC 4.3.1]
@@ -88,72 +142,118 @@ impl<'d, D: Driver<'d>> AudioClassOne<'d, D> {
         // Terminal topology:
         // Input terminal (receives audio stream) -> Feature Unit (mute and volume) -> Output terminal (e.g. towards speaker)
 
+        // =======================================
         // Input Terminal Descriptor [UAC 3.3.2.1]
         // Audio input
         let terminal_type: u16 = TerminalType::UsbStreaming.into();
-        let channel_config_left: u16 = ChannelConfig::LeftFront.into();
-        let channel_config_right: u16 = ChannelConfig::RightFront.into();
-        let channel_config = channel_config_left | channel_config_right;
+
+        // Assemble channel configuration field
+        let mut channel_config: u16 = 0x0000;
+        for audio_channel in audio_channels {
+            let channel: u16 = (*audio_channel).into();
+            if channel_config & channel != 0 {
+                panic!("Invalid channel config, duplicate channel {}.", channel);
+            }
+            channel_config |= channel;
+        }
 
         let input_terminal_descriptor = [
-            INPUT_TERMINAL, // bDescriptorSubtype.
-            INPUT_UNIT_ID,  // bTerminalID.
+            INPUT_TERMINAL, // bDescriptorSubtype
+            INPUT_UNIT_ID,  // bTerminalID
             terminal_type as u8,
-            (terminal_type >> 8) as u8, // wTerminalType.
-            0x00,                       // bAssocTerminal (none).
-            AUDIO_CHANNEL_COUNT as u8,  // bNrChannels.
+            (terminal_type >> 8) as u8, // wTerminalType
+            0x00,                       // bAssocTerminal (none)
+            audio_channels.len() as u8, // bNrChannels
             channel_config as u8,
-            (channel_config >> 8) as u8, // wChannelConfig.
-            0x00,                        // iChannelNames (none).
-            0x00,                        // iTerminal (none).
+            (channel_config >> 8) as u8, // wChannelConfig
+            0x00,                        // iChannelNames (none)
+            0x00,                        // iTerminal (none)
         ];
 
+        // ========================================
         // Output Terminal Descriptor [UAC 4.3.2.2]
         // Speaker output
         let terminal_type: u16 = TerminalType::OutSpeaker.into();
         let output_terminal_descriptor = [
-            OUTPUT_TERMINAL, // bDescriptorSubtype.
-            OUTPUT_UNIT_ID,  // bTerminalID.
+            OUTPUT_TERMINAL, // bDescriptorSubtype
+            OUTPUT_UNIT_ID,  // bTerminalID
             terminal_type as u8,
-            (terminal_type >> 8) as u8, // wTerminalType.
-            0x00,                       // bAssocTerminal (none).
-            FEATURE_UNIT_ID,            // bSourceID (the feature unit).
-            0x00,                       // iTerminal (none).
+            (terminal_type >> 8) as u8, // wTerminalType
+            0x00,                       // bAssocTerminal (none)
+            FEATURE_UNIT_ID,            // bSourceID (the feature unit)
+            0x00,                       // iTerminal (none)
         ];
 
+        // =====================================
         // Feature Unit Descriptor [UAC 4.3.2.5]
         // Mute and volume control
         let controls = MUTE_CONTROL | VOLUME_CONTROL;
-        let feature_unit_descriptor = [
-            FEATURE_UNIT,         // bDescriptorSubtype (Feature Unit).
-            FEATURE_UNIT_ID,      // bUnitID.
-            INPUT_UNIT_ID,        // bSourceID.
-            1,                    // bControlSize (one byte per control).
-            FU_CONTROL_UNDEFINED, // Master controls.
-            controls,             // Channel 0 controls
-            controls,             // Channel 1 controls
-            0x00,                 // iFeature (none)
+
+        const FEATURE_UNIT_DESCRIPTOR_SIZE: usize = 5;
+        let feature_unit_descriptor: [u8; FEATURE_UNIT_DESCRIPTOR_SIZE] = [
+            FEATURE_UNIT,         // bDescriptorSubtype (Feature Unit)
+            FEATURE_UNIT_ID,      // bUnitID
+            INPUT_UNIT_ID,        // bSourceID
+            1,                    // bControlSize (one byte per control)
+            FU_CONTROL_UNDEFINED, // Master controls (disabled)
         ];
 
+        let mut feature_unit_descriptor: Vec<u8, { 1 + FEATURE_UNIT_DESCRIPTOR_SIZE + MAX_AUDIO_CHANNEL_COUNT }> =
+            Vec::from_slice(&feature_unit_descriptor).unwrap();
+        for _ in 0..audio_channels.len() {
+            feature_unit_descriptor.push(controls).unwrap();
+        }
+        feature_unit_descriptor.push(0x00).unwrap(); // iFeature (none)
+
+        // ===============================================
+        // Format desciptor [UAC 4.5.3]
+        // Used later, for operational streaming interface
+        let format_descriptor = &[
+            FORMAT_TYPE,                // bDescriptorSubtype
+            FORMAT_TYPE_I,              // bFormatType
+            audio_channels.len() as u8, // bNrChannels
+            4u8,                        // bSubframeSize (32 bit)
+            32u8,                       // bBitResolution
+        ];
+
+        let mut format_descriptor: Vec<u8, { 6 + 3 * MAX_SAMPLE_RATE_COUNT }> =
+            Vec::from_slice(format_descriptor).unwrap();
+        format_descriptor.push(sample_rates_hz.len() as u8).unwrap();
+
+        for sample_rate_hz in sample_rates_hz {
+            assert!(*sample_rate_hz <= MAX_SAMPLE_RATE_HZ);
+            format_descriptor.push((sample_rate_hz & 0xFF) as u8).unwrap();
+            format_descriptor.push(((sample_rate_hz >> 8) & 0xFF) as u8).unwrap();
+            format_descriptor.push(((sample_rate_hz >> 16) & 0xFF) as u8).unwrap();
+        }
+
+        // ==================================================
         // Class-specific AC Interface Descriptor [UAC 4.3.2]
-        let total_length = 122;
+        const DESCRIPTOR_HEADER_SIZE: usize = 2;
+        const INTERFACE_DESCRIPTOR_SIZE: usize = 7;
+        const STREAMING_INTERFACE_DESCRIPTOR_SIZE: usize = 7;
+        const ALT_SETTING_DESCRIPTOR_SIZE: usize = 9;
+        const ENDPOINT_DESCRIPTOR_SIZE: usize = 9;
+        const CONFIGURATION_DESCRIPTOR_SIZE: usize = 9;
 
-        // FIXME: Calculate the length.
-        // (2 + input_terminal_descriptor.len())
-        //     + (2 + output_terminal_descriptor.len())
-        //     + (2 + feature_unit_descriptor.len())
-        //     + 9
-        //     + 28
-        //     + 18; // The size of the interface descriptor itself.
+        let total_descriptor_length = DESCRIPTOR_HEADER_SIZE + input_terminal_descriptor.len()
+            + DESCRIPTOR_HEADER_SIZE + output_terminal_descriptor.len()
+            + DESCRIPTOR_HEADER_SIZE + feature_unit_descriptor.len()
+            + DESCRIPTOR_HEADER_SIZE + INTERFACE_DESCRIPTOR_SIZE
+            + DESCRIPTOR_HEADER_SIZE + format_descriptor.len()
+            + STREAMING_INTERFACE_DESCRIPTOR_SIZE
+            + 3 * ALT_SETTING_DESCRIPTOR_SIZE  // Alt settings: control, zero-bandwidth and streaming
+            + 2 * ENDPOINT_DESCRIPTOR_SIZE + 7 // Endpoint descriptors: streaming and feedback
+            + CONFIGURATION_DESCRIPTOR_SIZE;
 
-        let interface_descriptor = [
+        let interface_descriptor: [u8; INTERFACE_DESCRIPTOR_SIZE] = [
             HEADER_SUBTYPE, // bDescriptorSubtype (Header)
             ADC_VERSION as u8,
             (ADC_VERSION >> 8) as u8, // bcdADC
-            total_length as u8,
-            (total_length >> 8) as u8, // wTotalLength
-            0x01,                      // bInCollection (1 streaming interface) // FIXME: variable?
-            streaming_interface,       // baInterfaceNr
+            total_descriptor_length as u8,
+            (total_descriptor_length >> 8) as u8, // wTotalLength
+            0x01,                                 // bInCollection (1 streaming interface)
+            streaming_interface,                  // baInterfaceNr
         ];
 
         alt.descriptor(CS_INTERFACE, &interface_descriptor);
@@ -161,44 +261,33 @@ impl<'d, D: Driver<'d>> AudioClassOne<'d, D> {
         alt.descriptor(CS_INTERFACE, &feature_unit_descriptor);
         alt.descriptor(CS_INTERFACE, &output_terminal_descriptor);
 
+        // =====================================================
         // Audio streaming interface, zero bandwidth [UAC 4.5.1]
         let mut interface = func.interface();
         let alt = interface.alt_setting(USB_AUDIO_CLASS, USB_AUDIOSTREAMING_SUBCLASS, PROTOCOL_NONE, None);
         drop(alt);
 
+        // ==================================================
         // Audio streaming interface, operational [UAC 4.5.1]
         let mut alt = interface.alt_setting(USB_AUDIO_CLASS, USB_AUDIOSTREAMING_SUBCLASS, PROTOCOL_NONE, None);
 
         alt.descriptor(
             CS_INTERFACE,
             &[
-                AS_GENERAL,    // bDescriptorSubtype.
-                INPUT_UNIT_ID, // bTerminalLink.
-                0x00,          // bDelay (none).
+                AS_GENERAL,    // bDescriptorSubtype
+                INPUT_UNIT_ID, // bTerminalLink
+                0x00,          // bDelay (none)
                 PCM as u8,
-                (PCM >> 8) as u8, // wFormatTag (PCM format).
+                (PCM >> 8) as u8, // wFormatTag (PCM format)
             ],
         );
 
-        alt.descriptor(
-            CS_INTERFACE,
-            &[
-                FORMAT_TYPE,               // bDescriptorSubtype.
-                FORMAT_TYPE_I,             // bFormatType.
-                AUDIO_CHANNEL_COUNT as u8, // bNrChannels.
-                4u8,                       // bSubframeSize. 32 bit.
-                32u8,                      // bBitResolution.
-                0x01,                      // bSamFreqType (discrete).
-                (48000 & 0xFF) as u8,
-                ((48000 >> 8) & 0xFF) as u8,
-                ((48000 >> 16) & 0xFF) as u8, // Audio sampling frequency, 48 kHz.
-            ],
-        );
+        alt.descriptor(CS_INTERFACE, &format_descriptor);
 
         let streaming_endpoint = alt.alloc_endpoint_out(EndpointType::Isochronous, max_packet_size, 1);
         let feedback_endpoint = alt.alloc_endpoint_in(
             EndpointType::Isochronous,
-            4, // Feedback packets are 32 bit, of which 24 are filled.
+            4, // Feedback packets are 24 (10.14 format for full-speed) or 32 bit (16.16 format high-speed)
             1,
         );
 
@@ -208,30 +297,31 @@ impl<'d, D: Driver<'d>> AudioClassOne<'d, D> {
             SynchronizationType::Asynchronous,
             UsageType::DataEndpoint,
             &[
-                0x00,                                 // bRefresh (0).
-                feedback_endpoint.info().addr.into(), // bSynchAddress (the feedback endpoint).
+                0x00,                                 // bRefresh (0)
+                feedback_endpoint.info().addr.into(), // bSynchAddress (the feedback endpoint)
             ],
         );
 
         alt.descriptor(
             CS_ENDPOINT,
             &[
-                AS_GENERAL, // bDescriptorSubtype (General).
-                0x01,       // bmAttributes - support sampling frequency adjustment.
-                0x02,       // bLockDelayUnits (PCM sample count).
+                AS_GENERAL, // bDescriptorSubtype (General)
+                0x01,       // bmAttributes - support sampling frequency adjustment
+                0x02,       // bLockDelayUnits (PCM sample count)
                 0x0000 as u8,
-                (0x0000 >> 8) as u8, // bLockDelay (0).
+                (0x0000 >> 8) as u8, // bLockDelay (0)
             ],
         );
 
-        // Write the feedback endpoint descriptor after the streaming endpoint descriptor. This is mandatory.
+        // Write the feedback endpoint descriptor after the streaming endpoint descriptor
+        // This is demanded by the USB audio class specification.
         alt.endpoint_descriptor(
             feedback_endpoint.info(),
             SynchronizationType::NoSynchronization,
-            UsageType::FeedbackEndpoint, // FIXME: check?
+            UsageType::FeedbackEndpoint,
             &[
-                0x03, // bRefresh.
-                0x00, // bSynchAddress (none).
+                feedback_refresh_period.into(), // bRefresh
+                0x00,                           // bSynchAddress (none)
             ],
         );
 
@@ -240,13 +330,13 @@ impl<'d, D: Driver<'d>> AudioClassOne<'d, D> {
         let control = state.control.write(Control {
             shared: &state.shared,
             streaming_endpoint_address: streaming_endpoint.info().addr.into(),
-            control_interface,
+            control_interface_number: control_interface,
         });
         builder.handler(control);
 
         let control = &state.shared;
 
-        AudioClassOne {
+        Uac1 {
             streaming_endpoint,
             feedback_endpoint,
             control,
@@ -271,28 +361,29 @@ impl<'d, D: Driver<'d>> AudioClassOne<'d, D> {
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct AudioSettings {
     /// Channel mute states.
-    pub is_muted: [bool; AUDIO_CHANNEL_COUNT],
+    pub is_muted: [bool; MAX_AUDIO_CHANNEL_COUNT],
     /// Channel volume levels in 8.8 format (in dB).
-    pub volume_8q8_db: [i16; AUDIO_CHANNEL_COUNT],
+    pub volume_8q8_db: [i16; MAX_AUDIO_CHANNEL_COUNT],
 }
 
 impl Default for AudioSettings {
     fn default() -> Self {
         AudioSettings {
-            is_muted: [true; AUDIO_CHANNEL_COUNT],
-            volume_8q8_db: [0; AUDIO_CHANNEL_COUNT],
+            is_muted: [true; MAX_AUDIO_CHANNEL_COUNT],
+            volume_8q8_db: [MAX_VOLUME_DB * VOLUME_STEPS_PER_DB; MAX_AUDIO_CHANNEL_COUNT],
         }
     }
 }
 
 struct Control<'a> {
-    control_interface: InterfaceNumber,
+    control_interface_number: InterfaceNumber,
     streaming_endpoint_address: u8,
     shared: &'a SharedControl,
 }
 
 /// Shared data between Control and the Audio Class
 struct SharedControl {
+    /// The collection of audio settings (volumes, mute states).
     audio_settings: CriticalSectionMutex<Cell<AudioSettings>>,
 
     /// The audio sample rate in Hz.
@@ -330,7 +421,7 @@ impl SharedControl {
 
 /// UAC1 stream for reading audio frames, and writing feedback information
 ///
-/// You can obtain a `Stream` with [`AudioClassOne::split`]
+/// You can obtain a `Stream` with [`Uac1::split`]
 pub struct Stream<'d, D: Driver<'d>> {
     streaming_endpoint: D::EndpointOut,
     feedback_endpoint: D::EndpointIn,
@@ -361,7 +452,7 @@ impl<'d, D: Driver<'d>> Stream<'d, D> {
 
 /// UAC1 control status change monitor
 ///
-/// You can obtain a `ControlChanged` with [`AudioClassOne::split`]
+/// You can obtain a `ControlChanged` with [`Uac1::split`]
 pub struct ControlChanged<'d> {
     control: &'d SharedControl,
 }
@@ -399,7 +490,7 @@ impl<'a> Control<'a> {
         let mute_state = data[0] != 0;
 
         match channel_index as usize {
-            1..=AUDIO_CHANNEL_COUNT => {
+            1..=MAX_AUDIO_CHANNEL_COUNT => {
                 audio_settings.is_muted[channel_index as usize - 1] = mute_state;
             }
             _ => {
@@ -421,7 +512,7 @@ impl<'a> Control<'a> {
         let volume = i16::from_ne_bytes(data[..2].try_into().expect("Failed to read volume."));
 
         match channel_index as usize {
-            1..=AUDIO_CHANNEL_COUNT => {
+            1..=MAX_AUDIO_CHANNEL_COUNT => {
                 audio_settings.volume_8q8_db[channel_index as usize - 1] = volume;
             }
             _ => {
@@ -435,13 +526,13 @@ impl<'a> Control<'a> {
     }
 
     fn interface_set_request(&mut self, req: control::Request, data: &[u8]) -> Option<OutResponse> {
-        let interface_index = req.index as u8;
+        let interface_number = req.index as u8;
         let entity_index = (req.index >> 8) as u8;
         let channel_index = req.value as u8;
         let control_unit = (req.value >> 8) as u8;
 
-        if interface_index != self.control_interface.into() {
-            trace!("Unhandled interface set request for interface {}", interface_index);
+        if interface_number != self.control_interface_number.into() {
+            trace!("Unhandled interface set request for interface {}", interface_number);
             return None;
         }
 
@@ -503,13 +594,13 @@ impl<'a> Control<'a> {
     }
 
     fn interface_get_request<'r>(&'r mut self, req: Request, buf: &'r mut [u8]) -> Option<InResponse<'r>> {
-        let interface_index = req.index as u8;
+        let interface_number = req.index as u8;
         let entity_index = (req.index >> 8) as u8;
         let channel_index = req.value as u8;
         let control_unit = (req.value >> 8) as u8;
 
-        if interface_index != self.control_interface.into() {
-            trace!("Unhandled interface get request for interface {}.", interface_index);
+        if interface_number != self.control_interface_number.into() {
+            trace!("Unhandled interface get request for interface {}.", interface_number);
             return None;
         }
 
@@ -527,7 +618,9 @@ impl<'a> Control<'a> {
                     let volume: i16;
 
                     match channel_index as usize {
-                        1..=AUDIO_CHANNEL_COUNT => volume = audio_settings.volume_8q8_db[channel_index as usize - 1],
+                        1..=MAX_AUDIO_CHANNEL_COUNT => {
+                            volume = audio_settings.volume_8q8_db[channel_index as usize - 1]
+                        }
                         _ => return Some(InResponse::Rejected),
                     }
 
@@ -541,7 +634,7 @@ impl<'a> Control<'a> {
                     let mute_state: bool;
 
                     match channel_index as usize {
-                        1..=AUDIO_CHANNEL_COUNT => mute_state = audio_settings.is_muted[channel_index as usize - 1],
+                        1..=MAX_AUDIO_CHANNEL_COUNT => mute_state = audio_settings.is_muted[channel_index as usize - 1],
                         _ => return Some(InResponse::Rejected),
                     }
 

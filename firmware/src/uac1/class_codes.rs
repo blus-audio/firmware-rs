@@ -2,7 +2,6 @@
 //! Definition for Audio Devices, Release 1.0, Appendix A and Universal Serial
 //! Bus Device Class Definition for Audio Data Formats, Release 1.0, Appendix
 //! A.1.1 (Audio Data Format Type I Codes)
-//!
 #![allow(dead_code)]
 
 /// The current version of the ADC specification (1.0)

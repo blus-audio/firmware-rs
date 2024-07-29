@@ -2,7 +2,7 @@
 #![no_main]
 
 use biquad::ToHertz;
-use blus_fw::uac1::{self};
+use blus_fw::uac1::{self, ChannelConfig};
 use blus_fw::{filters, tas2780};
 use core::cell::RefCell;
 use defmt::{info, panic, unwrap};
@@ -46,6 +46,8 @@ bind_interrupts!(struct Irqs {
 const Q31_SCALING_FACTOR: f32 = 2147483648.0;
 const DMA_BUFFER_SIZE: usize = 1024;
 const USB_PACKET_SIZE: usize = 96;
+
+const SAMPLE_RATE_HZ: u32 = 48000;
 const SAMPLE_SIZE: usize = 4;
 const SAMPLE_COUNT: usize = USB_PACKET_SIZE / SAMPLE_SIZE;
 const SAMPLE_BLOCK_COUNT: usize = 2;
@@ -57,12 +59,6 @@ static I2C_BUS: StaticCell<NoopMutex<RefCell<i2c::I2c<'static, Async>>>> = Stati
 static FILTERS: StaticCell<filters::Filters> = StaticCell::new();
 
 type SampleBlock = ([f32; SAMPLE_COUNT], usize);
-
-#[allow(unused)]
-enum SampleRate {
-    SampleRateUndefined,
-    SampleRate48000,
-}
 
 // Accessible by most system masters (Zone D2)
 #[link_section = ".sram1"]
@@ -136,7 +132,7 @@ async fn audio_routing_task(
     fn new_sai4a<'d>(
         sai4_resources: &'d mut Sai4Resources,
         sai4a_write_buffer: &'d mut [u32],
-        sample_rate: SampleRate,
+        sample_rate_hz: u32,
     ) -> sai::Sai<'d, peripherals::SAI4, u32> {
         let mut sai4a_config = sai::Config::default();
 
@@ -150,9 +146,9 @@ async fn audio_routing_task(
         sai4a_config.clock_strobe = sai::ClockStrobe::Rising;
         sai4a_config.bit_order = sai::BitOrder::MsbFirst;
 
-        match sample_rate {
-            SampleRate::SampleRateUndefined => (),
-            SampleRate::SampleRate48000 => sai4a_config.master_clock_divider = sai::MasterClockDivider::Div2,
+        match sample_rate_hz {
+            SAMPLE_RATE_HZ => sai4a_config.master_clock_divider = sai::MasterClockDivider::Div2,
+            _ => panic!("Unsupported SAI sample rate."),
         }
 
         let _sai4b_config = sai::Config::default();
@@ -172,14 +168,12 @@ async fn audio_routing_task(
         sai4a_driver
     }
 
-    const SAMPLE_RATE: SampleRate = SampleRate::SampleRate48000;
-    let mut sai4a_driver = new_sai4a(&mut sai4_resources, sai4a_write_buffer, SAMPLE_RATE);
+    let mut sai4a_driver = new_sai4a(&mut sai4_resources, sai4a_write_buffer, SAMPLE_RATE_HZ);
     sai4a_driver.start();
 
+    let filters = FILTERS.init(filters::Filters::new(SAMPLE_RATE_HZ.hz()));
+
     status_led.set_low();
-
-    let filters = FILTERS.init(filters::Filters::new(48.khz()));
-
     loop {
         let (samples, sample_count) = receiver.receive().await;
 
@@ -219,7 +213,7 @@ async fn audio_routing_task(
             info!("Renew SAI setup.");
 
             drop(sai4a_driver);
-            sai4a_driver = new_sai4a(&mut sai4_resources, sai4a_write_buffer, SAMPLE_RATE);
+            sai4a_driver = new_sai4a(&mut sai4_resources, sai4a_write_buffer, SAMPLE_RATE_HZ);
             sai4a_driver.start();
 
             PLAY_SIGNAL.signal(true);
@@ -466,11 +460,11 @@ async fn main(spawner: Spawner) {
     static EP_OUT_BUFFER: StaticCell<[u8; 2 * USB_PACKET_SIZE]> = StaticCell::new();
     let ep_out_buffer = EP_OUT_BUFFER.init([0u8; 2 * USB_PACKET_SIZE]);
 
-    static CONFIG_DESCRIPTOR: StaticCell<[u8; 256]> = StaticCell::new();
-    let config_descriptor = CONFIG_DESCRIPTOR.init([0; 256]);
+    static CONFIG_DESCRIPTOR: StaticCell<[u8; 128]> = StaticCell::new();
+    let config_descriptor = CONFIG_DESCRIPTOR.init([0; 128]);
 
-    static BOS_DESCRIPTOR: StaticCell<[u8; 256]> = StaticCell::new();
-    let bos_descriptor = BOS_DESCRIPTOR.init([0; 256]);
+    static BOS_DESCRIPTOR: StaticCell<[u8; 16]> = StaticCell::new();
+    let bos_descriptor = BOS_DESCRIPTOR.init([0; 16]);
 
     static CONTROL_BUF: StaticCell<[u8; 64]> = StaticCell::new();
     let control_buf = CONTROL_BUF.init([0; 64]);
@@ -514,6 +508,13 @@ async fn main(spawner: Spawner) {
     config.self_powered = true;
     config.max_power = 0;
 
+    // Required for windows compatibility.
+    // https://developer.nordicsemi.com/nRF_Connect_SDK/doc/1.9.1/kconfig/CONFIG_CDC_ACM_IAD.html#help
+    config.device_class = 0xEF;
+    config.device_sub_class = 0x02;
+    config.device_protocol = 0x01;
+    config.composite_with_iads = true;
+
     let mut builder = embassy_usb::Builder::new(
         usb_driver,
         config,
@@ -524,7 +525,14 @@ async fn main(spawner: Spawner) {
     );
 
     // Create classes on the builder
-    let class = uac1::AudioClassOne::new(&mut builder, state, USB_PACKET_SIZE as u16);
+    let class = uac1::Uac1::new(
+        &mut builder,
+        state,
+        USB_PACKET_SIZE as u16,
+        &[SAMPLE_RATE_HZ],
+        &[ChannelConfig::LeftFront, ChannelConfig::RightFront],
+        uac1::FeedbackRefreshPeriod::Period8ms,
+    );
     let (mut stream, control_changed) = class.split();
 
     // Build and run the USB device
