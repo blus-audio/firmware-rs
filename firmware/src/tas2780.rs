@@ -175,24 +175,12 @@ where
         self.write_register(BOOK_REGISTER, value)
     }
 
-    fn read(&mut self, address: u8, read: &mut [u8]) {
+    fn _read(&mut self, address: u8, read: &mut [u8]) {
         let address: [u8; 1] = [address];
 
         self.i2c
             .write_read(self.address, &address, read)
             .expect("Failed to read from TAS2780.")
-    }
-
-    pub fn diag(&mut self) {
-        self.set_book(0);
-        self.set_page(0);
-
-        let mut read: [u8; 1] = [0u8; 1];
-        self.read(0x03, &mut read);
-
-        trace!("Got {}", read);
-
-        self.write_register(0x02, 0x80); // Power up playback with I-sense, V-sense enabled
     }
 
     /// Set the attenuation in steps of 0.5 dB.

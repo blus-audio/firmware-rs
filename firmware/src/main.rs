@@ -20,7 +20,8 @@ use embassy_sync::blocking_mutex::NoopMutex;
 use embassy_sync::signal::Signal;
 use embassy_sync::zerocopy_channel::{Channel, Receiver, Sender};
 use embassy_time::{Duration, Ticker, Timer};
-use embassy_usb::class::uac1::{self, ChannelConfig};
+use embassy_usb::class::uac1;
+use embassy_usb::class::uac1::speaker::{self, Speaker};
 use embassy_usb::driver::EndpointError;
 use grounded::uninit::GroundedArrayCell;
 use heapless::Vec;
@@ -163,7 +164,6 @@ async fn audio_routing_task(
 
     let filters = FILTERS.init(filters::Filters::new(SAMPLE_RATE_HZ.hz()));
 
-    status_led.set_low();
     loop {
         let (samples, sample_count) = receiver.receive().await;
 
@@ -216,14 +216,6 @@ async fn amplifier_task(amplifier_resources: AmplifierResources) {
     use blus_fw::tas2780::*;
 
     let mut pin_nsd = amplifier_resources.pin_nsd;
-
-    info!("Reset amplifiers.");
-    pin_nsd.set_low();
-    Timer::after_millis(1).await;
-    pin_nsd.set_high();
-
-    // Wait for reset
-    Timer::after_millis(10).await;
 
     let i2c_bus = NoopMutex::new(RefCell::new(amplifier_resources.i2c));
     let i2c_bus = I2C_BUS.init(i2c_bus);
@@ -280,6 +272,14 @@ async fn amplifier_task(amplifier_resources: AmplifierResources) {
         NOISE_GATE,
     );
 
+    info!("Reset amplifiers.");
+    pin_nsd.set_low();
+    Timer::after_millis(10).await;
+    pin_nsd.set_high();
+
+    // Wait for reset
+    Timer::after_millis(10).await;
+
     info!("Initialize TAS2780");
     for amplifier in [&mut tas2780_a, &mut tas2780_b, &mut tas2780_c, &mut tas2780_d] {
         amplifier.init().await;
@@ -315,7 +315,7 @@ async fn amplifier_task(amplifier_resources: AmplifierResources) {
 #[embassy_executor::task]
 async fn volume_control_task(
     mut adc_resources: AdcResources<peripherals::ADC1>,
-    control_changed: uac1::ControlChanged<'static>,
+    control_changed: speaker::ControlChanged<'static>,
     mut status_led: Output<'static>,
 ) {
     let mut pot_ticker = Ticker::every(Duration::from_hz(1));
@@ -387,12 +387,11 @@ async fn volume_control_task(
 
 #[embassy_executor::task]
 async fn heartbeat_task(mut status_led: Output<'static>) {
-    loop {
-        status_led.set_high();
-        Timer::after_millis(100).await;
+    let mut ticker = Ticker::every(Duration::from_hz(2));
 
-        status_led.set_low();
-        Timer::after_secs(2).await;
+    loop {
+        ticker.next().await;
+        status_led.toggle();
     }
 }
 
@@ -406,14 +405,14 @@ async fn main(spawner: Spawner) {
             freq: Hertz(24_576_000),
             mode: HseMode::Bypass,
         });
-        peripheral_config.rcc.hsi = Some(HSIPrescaler::DIV1);
+        peripheral_config.rcc.hsi = None;
         peripheral_config.rcc.csi = true;
         peripheral_config.rcc.hsi48 = Some(Hsi48Config { sync_from_usb: false });
         peripheral_config.rcc.pll1 = Some(Pll {
             source: PllSource::HSE,
             prediv: PllPreDiv::DIV4,
             mul: PllMul::MUL80,
-            divp: Some(PllDiv::DIV1),  // 491.52 MHz
+            divp: Some(PllDiv::DIV4),  // 122.88 MHz
             divq: Some(PllDiv::DIV20), // 24.576 MHz for SAI4
             divr: Some(PllDiv::DIV2),  // 245.76 MHz
         });
@@ -425,23 +424,29 @@ async fn main(spawner: Spawner) {
             divq: Some(PllDiv::DIV8), // 48 MHz for USB
             divr: Some(PllDiv::DIV2), // 192 MHz
         });
-        peripheral_config.rcc.sys = Sysclk::PLL1_P; // 491.52 Mhz
+        peripheral_config.rcc.sys = Sysclk::PLL1_P;
         peripheral_config.rcc.ahb_pre = AHBPrescaler::DIV2;
         peripheral_config.rcc.apb1_pre = APBPrescaler::DIV2;
         peripheral_config.rcc.apb2_pre = APBPrescaler::DIV2;
         peripheral_config.rcc.apb3_pre = APBPrescaler::DIV2;
         peripheral_config.rcc.apb4_pre = APBPrescaler::DIV2;
-        peripheral_config.rcc.voltage_scale = VoltageScale::Scale0;
+
+        // Voltage scaling
+        // 0 (<= 520 MHz)
+        // 1 (<= 400 MHz)
+        // 2 (<= 300 MHz)
+        // 3 (<= 170 MHz)
+        peripheral_config.rcc.voltage_scale = VoltageScale::Scale3;
         peripheral_config.rcc.mux.usbsel = mux::Usbsel::PLL3_Q;
         peripheral_config.rcc.mux.sai1sel = mux::Saisel::PLL1_Q;
         peripheral_config.rcc.mux.adcsel = mux::Adcsel::PLL3_R;
     }
     let p = embassy_stm32::init(peripheral_config);
 
-    let mut led_blue = Output::new(p.PC6, Level::High, Speed::Low);
-    let mut led_green = Output::new(p.PC7, Level::High, Speed::Low);
-    let mut led_yellow = Output::new(p.PC8, Level::High, Speed::Low);
-    let mut led_red = Output::new(p.PC9, Level::High, Speed::Low);
+    let mut led_blue = Output::new(p.PC6, Level::Low, Speed::Low);
+    let mut led_green = Output::new(p.PC7, Level::Low, Speed::Low);
+    let mut led_yellow = Output::new(p.PC8, Level::Low, Speed::Low);
+    let mut led_red = Output::new(p.PC9, Level::Low, Speed::Low);
 
     for led in [&mut led_blue, &mut led_green, &mut led_yellow, &mut led_red] {
         led.set_low();
@@ -459,8 +464,8 @@ async fn main(spawner: Spawner) {
     static CONTROL_BUF: StaticCell<[u8; 64]> = StaticCell::new();
     let control_buf = CONTROL_BUF.init([0; 64]);
 
-    static STATE: StaticCell<uac1::State> = StaticCell::new();
-    let state = STATE.init(uac1::State::new());
+    static STATE: StaticCell<speaker::State> = StaticCell::new();
+    let state = STATE.init(speaker::State::new());
 
     // Create the driver, from the HAL.
     let mut usb_config = usb::Config::default();
@@ -514,14 +519,14 @@ async fn main(spawner: Spawner) {
         control_buf,
     );
 
-    // Create the UAC1 class components
-    let (mut stream, control_changed) = uac1::Uac1::new(
+    // Create the UAC1 Speaker class components
+    let (mut stream, control_changed) = Speaker::new(
         &mut builder,
         state,
         USB_PACKET_SIZE as u16,
-        uac1::Resolution::Resolution32Bit,
+        uac1::SampleResolution::Resolution32Bit,
         &[SAMPLE_RATE_HZ],
-        &[ChannelConfig::LeftFront, ChannelConfig::RightFront],
+        &[uac1::ChannelConfig::LeftFront, uac1::ChannelConfig::RightFront],
         uac1::FeedbackRefreshPeriod::Period8ms,
     );
 
@@ -547,13 +552,13 @@ async fn main(spawner: Spawner) {
             p.PB6,
             p.PB7,
             Irqs,
-            p.DMA1_CH4,
-            p.DMA1_CH5,
+            p.DMA2_CH0,
+            p.DMA2_CH1,
             Hertz(1_000_000),
             Default::default(),
         ),
-        pin_nsd: Output::new(p.PC12, Level::High, Speed::Low),
-        pin_irqz: Input::new(p.PC13, Pull::None),
+        pin_nsd: Output::new(p.PC13, Level::Low, Speed::Low),
+        pin_irqz: Input::new(p.PC14, Pull::None),
     };
 
     let adc_resources = AdcResources {
@@ -602,7 +607,7 @@ impl From<EndpointError> for Disconnected {
 }
 
 async fn receive<'d, T: usb::Instance + 'd>(
-    stream: &mut uac1::Stream<'d, usb::Driver<'d, T>>,
+    stream: &mut speaker::Stream<'d, usb::Driver<'d, T>>,
     sender: &mut Sender<'static, NoopRawMutex, SampleBlock>,
 ) -> Result<(), Disconnected> {
     loop {
