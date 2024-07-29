@@ -39,7 +39,7 @@ const DMA_BUFFER_SIZE: usize = 1024;
 const USB_PACKET_SIZE: usize = 96;
 
 const SAMPLE_RATE_HZ: u32 = 48000;
-const SAMPLE_SIZE: usize = 4;
+const SAMPLE_SIZE: usize = uac1::SampleWidth::Width4Byte as usize;
 const SAMPLE_COUNT: usize = USB_PACKET_SIZE / SAMPLE_SIZE;
 const SAMPLE_BLOCK_COUNT: usize = 2;
 
@@ -387,7 +387,7 @@ async fn volume_control_task(
 
 #[embassy_executor::task]
 async fn heartbeat_task(mut status_led: Output<'static>) {
-    let mut ticker = Ticker::every(Duration::from_hz(2));
+    let mut ticker = Ticker::every(Duration::from_hz(1));
 
     loop {
         ticker.next().await;
@@ -407,7 +407,7 @@ async fn main(spawner: Spawner) {
         });
         peripheral_config.rcc.hsi = None;
         peripheral_config.rcc.csi = true;
-        peripheral_config.rcc.hsi48 = Some(Hsi48Config { sync_from_usb: false });
+        peripheral_config.rcc.hsi48 = None;
         peripheral_config.rcc.pll1 = Some(Pll {
             source: PllSource::HSE,
             prediv: PllPreDiv::DIV4,
@@ -524,7 +524,7 @@ async fn main(spawner: Spawner) {
         &mut builder,
         state,
         USB_PACKET_SIZE as u16,
-        uac1::SampleResolution::Resolution32Bit,
+        uac1::SampleWidth::Width4Byte,
         &[SAMPLE_RATE_HZ],
         &[uac1::ChannelConfig::LeftFront, uac1::ChannelConfig::RightFront],
         uac1::FeedbackRefreshPeriod::Period8ms,
@@ -567,6 +567,7 @@ async fn main(spawner: Spawner) {
         dma: p.DMA1_CH0,
     };
 
+    // Establish a zero-copy channel for transferring received audio samples between tasks
     static SAMPLE_BLOCKS: StaticCell<[SampleBlock; SAMPLE_BLOCK_COUNT]> = StaticCell::new();
     let sample_blocks = SAMPLE_BLOCKS.init([([0.0; SAMPLE_COUNT], 0); SAMPLE_BLOCK_COUNT]);
 

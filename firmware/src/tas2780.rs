@@ -288,7 +288,7 @@ where
 
             self.write_register(
                 0x35,
-                (noise_gate.hysteresis as u8) << 5 | (noise_gate.level as u8) << 3 | ENABLE_NOISE_GATE << 1 | 0b01,
+                (noise_gate.hysteresis as u8) << 5 | (noise_gate.level as u8) << 3 | ENABLE_NOISE_GATE << 2 | 0b01,
             );
         }
 
