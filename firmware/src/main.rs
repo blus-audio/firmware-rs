@@ -519,6 +519,7 @@ async fn main(spawner: Spawner) {
         &mut builder,
         state,
         USB_PACKET_SIZE as u16,
+        uac1::Resolution::Resolution32Bit,
         &[SAMPLE_RATE_HZ],
         &[ChannelConfig::LeftFront, ChannelConfig::RightFront],
         uac1::FeedbackRefreshPeriod::Period8ms,
