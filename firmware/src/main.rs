@@ -2,7 +2,6 @@
 #![no_main]
 
 use biquad::ToHertz;
-use blus_fw::uac1::{self, ChannelConfig};
 use blus_fw::{filters, tas2780};
 use core::cell::RefCell;
 use defmt::{info, panic, unwrap};
@@ -31,7 +30,10 @@ use embassy_sync::{
     zerocopy_channel::{Channel, Receiver, Sender},
 };
 use embassy_time::{Duration, Ticker, Timer};
-use embassy_usb::driver::EndpointError;
+use embassy_usb::{
+    class::uac1::{self, ChannelConfig},
+    driver::EndpointError,
+};
 use grounded::uninit::GroundedArrayCell;
 use heapless::Vec;
 use static_cell::StaticCell;
@@ -524,8 +526,8 @@ async fn main(spawner: Spawner) {
         control_buf,
     );
 
-    // Create classes on the builder
-    let class = uac1::Uac1::new(
+    // Create the UAC1 class components
+    let (mut stream, control_changed) = uac1::Uac1::new(
         &mut builder,
         state,
         USB_PACKET_SIZE as u16,
@@ -533,7 +535,6 @@ async fn main(spawner: Spawner) {
         &[ChannelConfig::LeftFront, ChannelConfig::RightFront],
         uac1::FeedbackRefreshPeriod::Period8ms,
     );
-    let (mut stream, control_changed) = class.split();
 
     // Build and run the USB device
     let mut usb_device = builder.build();
@@ -618,7 +619,7 @@ async fn receive<'d, T: usb::Instance + 'd>(
     loop {
         let mut usb_data = [0u8; USB_PACKET_SIZE];
 
-        // let feedback_value: u32 = 393216; // Ideal for 48 kHz, in 16uq16 kHz format?
+        // let feedback_value: u32 = (SAMPLE_RATE_HZ / 1000 / 8) << 16; // Ideal for 48 kHz, in 16uq16 kHz format?
         // stream
         //     .write_packet(&[
         //         feedback_value as u8,
@@ -628,6 +629,7 @@ async fn receive<'d, T: usb::Instance + 'd>(
         //     ])
         //     .await?;
         let data_size = stream.read_packet(&mut usb_data).await?;
+
         let word_count = data_size / SAMPLE_SIZE;
 
         if word_count * SAMPLE_SIZE == data_size {
