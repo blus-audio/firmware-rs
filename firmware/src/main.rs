@@ -1,39 +1,27 @@
 #![no_std]
 #![no_main]
 
+use core::cell::RefCell;
+
 use biquad::ToHertz;
 use blus_fw::{filters, tas2780};
-use core::cell::RefCell;
 use defmt::{info, panic, unwrap};
 use embassy_embedded_hal::shared_bus::blocking::i2c::I2cDevice;
 use embassy_executor::Spawner;
-use embassy_futures::{
-    join::join,
-    select::{select, Either},
-};
-use embassy_stm32::{
-    adc::{self, AdcChannel},
-    bind_interrupts,
-    gpio::{Input, Level, Output, Pull, Speed},
-    i2c,
-    mode::Async,
-    peripherals,
-    time::Hertz,
-    usb,
-};
-use embassy_sync::{
-    blocking_mutex::{
-        raw::{NoopRawMutex, ThreadModeRawMutex},
-        NoopMutex,
-    },
-    signal::Signal,
-    zerocopy_channel::{Channel, Receiver, Sender},
-};
+use embassy_futures::join::join;
+use embassy_futures::select::{select, Either};
+use embassy_stm32::adc::{self, AdcChannel};
+use embassy_stm32::gpio::{Input, Level, Output, Pull, Speed};
+use embassy_stm32::mode::Async;
+use embassy_stm32::time::Hertz;
+use embassy_stm32::{bind_interrupts, i2c, peripherals, usb};
+use embassy_sync::blocking_mutex::raw::{NoopRawMutex, ThreadModeRawMutex};
+use embassy_sync::blocking_mutex::NoopMutex;
+use embassy_sync::signal::Signal;
+use embassy_sync::zerocopy_channel::{Channel, Receiver, Sender};
 use embassy_time::{Duration, Ticker, Timer};
-use embassy_usb::{
-    class::uac1::{self, ChannelConfig},
-    driver::EndpointError,
-};
+use embassy_usb::class::uac1::{self, ChannelConfig};
+use embassy_usb::driver::EndpointError;
 use grounded::uninit::GroundedArrayCell;
 use heapless::Vec;
 use static_cell::StaticCell;
