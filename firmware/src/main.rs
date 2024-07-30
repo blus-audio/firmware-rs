@@ -5,20 +5,23 @@ use core::cell::RefCell;
 
 use biquad::ToHertz;
 use blus_fw::{filters, tas2780};
+use cortex_m_rt::entry;
 use defmt::{info, panic, unwrap};
 use embassy_embedded_hal::shared_bus::blocking::i2c::I2cDevice;
-use embassy_executor::Spawner;
+use embassy_executor::{Executor, InterruptExecutor};
 use embassy_futures::join::join;
 use embassy_futures::select::{select, Either};
 use embassy_stm32::adc::{self, AdcChannel};
 use embassy_stm32::gpio::{Input, Level, Output, Pull, Speed};
+use embassy_stm32::interrupt;
+use embassy_stm32::interrupt::{InterruptExt, Priority};
 use embassy_stm32::mode::Async;
 use embassy_stm32::time::Hertz;
 use embassy_stm32::{bind_interrupts, i2c, peripherals, usb};
 use embassy_sync::blocking_mutex::raw::{NoopRawMutex, ThreadModeRawMutex};
 use embassy_sync::blocking_mutex::NoopMutex;
 use embassy_sync::signal::Signal;
-use embassy_sync::zerocopy_channel::{Channel, Receiver, Sender};
+use embassy_sync::zerocopy_channel;
 use embassy_time::{Duration, Ticker, Timer};
 use embassy_usb::class::uac1;
 use embassy_usb::class::uac1::speaker::{self, Speaker};
@@ -33,6 +36,14 @@ bind_interrupts!(struct Irqs {
     I2C1_EV => i2c::EventInterruptHandler<peripherals::I2C1>;
     I2C1_ER => i2c::ErrorInterruptHandler<peripherals::I2C1>;
 });
+
+static EXECUTOR_HIGH: InterruptExecutor = InterruptExecutor::new();
+static EXECUTOR_LOW: StaticCell<Executor> = StaticCell::new();
+
+#[interrupt]
+unsafe fn UART4() {
+    EXECUTOR_HIGH.on_interrupt()
+}
 
 const Q31_SCALING_FACTOR: f32 = 2147483648.0;
 const DMA_BUFFER_SIZE: usize = 1024;
@@ -108,7 +119,7 @@ fn sample_as_f32(sample: u32) -> f32 {
 #[embassy_executor::task]
 async fn audio_routing_task(
     mut sai4_resources: Sai4Resources,
-    mut receiver: Receiver<'static, NoopRawMutex, SampleBlock>,
+    mut receiver: zerocopy_channel::Receiver<'static, NoopRawMutex, SampleBlock>,
     mut status_led: Output<'static>,
 ) {
     use embassy_stm32::sai;
@@ -161,7 +172,7 @@ async fn audio_routing_task(
     let mut sai4a_driver = new_sai4a(&mut sai4_resources, sai4a_write_buffer, SAMPLE_RATE_HZ);
     sai4a_driver.start();
 
-    let (mut f_a, mut f_b, mut f_c, mut f_d) = filters::get_filters(SAMPLE_RATE_HZ.hz());
+    let (mut filter_a, mut filter_b, mut filter_c, mut filter_d) = filters::get_filters(SAMPLE_RATE_HZ.hz());
 
     loop {
         let (samples, sample_count) = receiver.receive().await;
@@ -169,27 +180,25 @@ async fn audio_routing_task(
         let mut samples_u32: Vec<u32, { 2 * SAMPLE_COUNT }> = Vec::new();
 
         status_led.set_high();
-
         for index in 0..*sample_count / 2 {
             let sample_left = samples[2 * index];
             let sample_right = samples[2 * index + 1];
 
-            let mut sample_a = sample_left;
-            let mut sample_b = sample_left;
-            let mut sample_c = sample_right;
-            let mut sample_d = sample_right;
+            let sample_a = sample_left;
+            let sample_b = sample_left;
+            let sample_c = sample_right;
+            let sample_d = sample_right;
 
-            sample_a = f_a.run(sample_a);
-            sample_b = f_b.run(sample_b);
-            sample_c = f_c.run(sample_c);
-            sample_d = f_d.run(sample_d);
+            let sample_a = filter_a.run(sample_a);
+            let sample_b = filter_b.run(sample_b);
+            let sample_c = filter_c.run(sample_c);
+            let sample_d = filter_d.run(sample_d);
 
             samples_u32.push(sample_as_u32(sample_a)).unwrap();
             samples_u32.push(sample_as_u32(sample_b)).unwrap();
             samples_u32.push(sample_as_u32(sample_c)).unwrap();
             samples_u32.push(sample_as_u32(sample_d)).unwrap();
         }
-
         status_led.set_low();
 
         let result = sai4a_driver.write(&samples_u32[..*sample_count * 2]).await;
@@ -317,21 +326,13 @@ async fn volume_control_task(
     control_changed: speaker::ControlChanged<'static>,
     mut status_led: Output<'static>,
 ) {
-    let mut pot_ticker = Ticker::every(Duration::from_hz(1));
-
     let adc1_measurement_buffer: &mut [u16] = unsafe {
         ADC1_MEASUREMENT_BUFFER.initialize_all_copied(0);
         let (ptr, len) = ADC1_MEASUREMENT_BUFFER.get_ptr_len();
         core::slice::from_raw_parts_mut(ptr, len)
     };
 
-    // Measure the potentiometer in intervals that are given by the ticker.
-    async fn measure(
-        ticker: &mut Ticker,
-        adc_resources: &mut AdcResources<peripherals::ADC1>,
-        measurement_buffer: &mut [u16],
-    ) -> u8 {
-        ticker.next().await;
+    async fn measure(adc_resources: &mut AdcResources<peripherals::ADC1>, measurement_buffer: &mut [u16]) -> u8 {
         adc_resources
             .adc
             .read(
@@ -350,12 +351,16 @@ async fn volume_control_task(
     // The TAS2780 understands volume levels from 0 (0 dB) to 0xC8 (-100 dB), where one step is 0.5 dB.
     let attenuation_8q8_db_to_tas2780 = |x: i16| (-x >> 7) as u8;
 
+    // Define update rates
+    let mut control_changed_ticker = Ticker::every(Duration::from_hz(10));
+    let mut pot_ticker = Ticker::every(Duration::from_hz(1));
+
     loop {
-        let control_changed_fut = control_changed.control_changed();
-        let pot_measured_fut = measure(&mut pot_ticker, &mut adc_resources, adc1_measurement_buffer);
+        let control_changed_fut = join(control_changed.control_changed(), control_changed_ticker.next());
+        let pot_measured_fut = join(measure(&mut adc_resources, adc1_measurement_buffer), pot_ticker.next());
 
         match select(pot_measured_fut, control_changed_fut).await {
-            Either::First(_measured) => (),
+            Either::First((_measured, _)) => (),
             Either::Second(_) => {
                 status_led.set_high();
 
@@ -377,9 +382,6 @@ async fn volume_control_task(
                 }
 
                 VOLUME_ADC_SIGNAL.signal((volume_left, volume_right));
-
-                // Limit the rate of volume updates
-                Timer::after_millis(10).await;
                 status_led.set_low();
             }
         }
@@ -396,8 +398,27 @@ async fn heartbeat_task(mut status_led: Output<'static>) {
     }
 }
 
-#[embassy_executor::main]
-async fn main(spawner: Spawner) {
+#[embassy_executor::task]
+async fn usb_task(
+    mut stream: speaker::Stream<'static, usb::Driver<'static, peripherals::USB_OTG_HS>>,
+    mut sender: zerocopy_channel::Sender<'static, NoopRawMutex, SampleBlock>,
+    mut usb_device: embassy_usb::UsbDevice<'static, usb::Driver<'static, peripherals::USB_OTG_HS>>,
+) {
+    let receive_fut = async {
+        loop {
+            stream.wait_connection().await;
+            info!("Connected");
+            let _ = receive(&mut stream, &mut sender).await;
+            info!("Disconnected");
+        }
+    };
+
+    // Run everything concurrently.
+    join(usb_device.run(), receive_fut).await;
+}
+
+#[entry]
+fn main() -> ! {
     let mut peripheral_config = embassy_stm32::Config::default();
     {
         // Uses a 24.576 MHz external oscillator.
@@ -521,7 +542,7 @@ async fn main(spawner: Spawner) {
     );
 
     // Create the UAC1 Speaker class components
-    let (mut stream, control_changed) = Speaker::new(
+    let (stream, control_changed) = Speaker::new(
         &mut builder,
         state,
         USB_PACKET_SIZE as u16,
@@ -532,8 +553,7 @@ async fn main(spawner: Spawner) {
     );
 
     // Build and run the USB device
-    let mut usb_device = builder.build();
-    let usb_fut = usb_device.run();
+    let usb_device = builder.build();
 
     let sai4_resources = Sai4Resources {
         sai: p.SAI4,
@@ -572,29 +592,29 @@ async fn main(spawner: Spawner) {
     static SAMPLE_BLOCKS: StaticCell<[SampleBlock; SAMPLE_BLOCK_COUNT]> = StaticCell::new();
     let sample_blocks = SAMPLE_BLOCKS.init([([0.0; SAMPLE_COUNT], 0); SAMPLE_BLOCK_COUNT]);
 
-    static CHANNEL: StaticCell<Channel<'_, NoopRawMutex, SampleBlock>> = StaticCell::new();
-    let channel = CHANNEL.init(Channel::new(sample_blocks));
-    let (mut sender, receiver) = channel.split();
+    static CHANNEL: StaticCell<zerocopy_channel::Channel<'_, NoopRawMutex, SampleBlock>> = StaticCell::new();
+    let channel = CHANNEL.init(zerocopy_channel::Channel::new(sample_blocks));
+    let (sender, receiver) = channel.split();
 
     // let mut tim_2 = timer::low_level::Timer::new(p.TIM2);
     // tim_2.set_trigger_source(timer::low_level::TriggerSource::ITR5);
 
-    unwrap!(spawner.spawn(heartbeat_task(led_red)));
-    unwrap!(spawner.spawn(audio_routing_task(sai4_resources, receiver, led_blue)));
-    unwrap!(spawner.spawn(volume_control_task(adc_resources, control_changed, led_yellow)));
-    unwrap!(spawner.spawn(amplifier_task(amplifier_resources)));
+    // High-priority executor: UART4, priority level 6
+    interrupt::UART4.set_priority(Priority::P6);
+    let _high_spawner = EXECUTOR_HIGH.start(interrupt::UART4);
 
-    let receive_fut = async {
-        loop {
-            stream.wait_connection().await;
-            info!("Connected");
-            let _ = receive(&mut stream, &mut sender).await;
-            info!("Disconnected");
-        }
-    };
+    // unwrap!(high_spawner.spawn(usb_task(stream, sender, usb_device)));
+    // unwrap!(high_spawner.spawn(audio_routing_task(sai4_resources, receiver, led_blue)));
 
-    // Run everything concurrently.
-    join(usb_fut, receive_fut).await;
+    // Low priority executor: runs in thread mode, using WFE/SEV
+    let executor = EXECUTOR_LOW.init(Executor::new());
+    executor.run(|low_spawner| {
+        unwrap!(low_spawner.spawn(usb_task(stream, sender, usb_device)));
+        unwrap!(low_spawner.spawn(audio_routing_task(sai4_resources, receiver, led_blue)));
+        unwrap!(low_spawner.spawn(heartbeat_task(led_red)));
+        unwrap!(low_spawner.spawn(volume_control_task(adc_resources, control_changed, led_yellow)));
+        unwrap!(low_spawner.spawn(amplifier_task(amplifier_resources)));
+    });
 }
 
 struct Disconnected {}
@@ -610,7 +630,7 @@ impl From<EndpointError> for Disconnected {
 
 async fn receive<'d, T: usb::Instance + 'd>(
     stream: &mut speaker::Stream<'d, usb::Driver<'d, T>>,
-    sender: &mut Sender<'static, NoopRawMutex, SampleBlock>,
+    sender: &mut zerocopy_channel::Sender<'static, NoopRawMutex, SampleBlock>,
 ) -> Result<(), Disconnected> {
     loop {
         let mut usb_data = [0u8; USB_PACKET_SIZE];
