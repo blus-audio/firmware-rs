@@ -47,7 +47,6 @@ static PLAY_SIGNAL: Signal<ThreadModeRawMutex, bool> = Signal::new();
 static VOLUME_ADC_SIGNAL: Signal<ThreadModeRawMutex, (u8, u8)> = Signal::new();
 
 static I2C_BUS: StaticCell<NoopMutex<RefCell<i2c::I2c<'static, Async>>>> = StaticCell::new();
-static FILTERS: StaticCell<filters::Filters> = StaticCell::new();
 
 type SampleBlock = ([f32; SAMPLE_COUNT], usize);
 
@@ -162,7 +161,7 @@ async fn audio_routing_task(
     let mut sai4a_driver = new_sai4a(&mut sai4_resources, sai4a_write_buffer, SAMPLE_RATE_HZ);
     sai4a_driver.start();
 
-    let filters = FILTERS.init(filters::Filters::new(SAMPLE_RATE_HZ.hz()));
+    let (mut f_a, mut f_b, mut f_c, mut f_d) = filters::get_filters(SAMPLE_RATE_HZ.hz());
 
     loop {
         let (samples, sample_count) = receiver.receive().await;
@@ -180,10 +179,10 @@ async fn audio_routing_task(
             let mut sample_c = sample_right;
             let mut sample_d = sample_right;
 
-            sample_a = filters::run_filters(sample_a, &mut filters.biquads_a, filters.gain_a);
-            sample_b = filters::run_filters(sample_b, &mut filters.biquads_b, filters.gain_b);
-            sample_c = filters::run_filters(sample_c, &mut filters.biquads_c, filters.gain_c);
-            sample_d = filters::run_filters(sample_d, &mut filters.biquads_d, filters.gain_d);
+            sample_a = f_a.run(sample_a);
+            sample_b = f_b.run(sample_b);
+            sample_c = f_c.run(sample_c);
+            sample_d = f_d.run(sample_d);
 
             samples_u32.push(sample_as_u32(sample_a)).unwrap();
             samples_u32.push(sample_as_u32(sample_b)).unwrap();
@@ -582,7 +581,7 @@ async fn main(spawner: Spawner) {
 
     unwrap!(spawner.spawn(heartbeat_task(led_red)));
     unwrap!(spawner.spawn(audio_routing_task(sai4_resources, receiver, led_blue)));
-    // unwrap!(spawner.spawn(volume_control_task(adc_resources, control_changed, led_yellow)));
+    unwrap!(spawner.spawn(volume_control_task(adc_resources, control_changed, led_yellow)));
     unwrap!(spawner.spawn(amplifier_task(amplifier_resources)));
 
     let receive_fut = async {
