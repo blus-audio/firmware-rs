@@ -1,4 +1,5 @@
 use biquad::*;
+use defmt::info;
 use heapless::Vec;
 use micromath::F32Ext;
 
@@ -130,12 +131,20 @@ pub fn get_filters(fs: Hertz<f32>) -> (Filter, Filter, Filter, Filter) {
 
 pub struct Filter {
     gain: f32,
-    delay_line: Vec<f32, MAX_DELAY_LENGTH>,
+    /// For applying delay, a sample is first pushed, then the oldest one popped.
+    /// After pushing, there is one more sample in the delay line than the delay is long.
+    delay_line: Vec<f32, { MAX_DELAY_LENGTH + 1 }>,
     biquads: Vec<DirectForm2Transposed<f32>, MAX_BIQUAD_COUNT>,
 }
 
 impl Filter {
     /// Create a new filter instance.
+    ///
+    /// # Arguments
+    ///
+    /// * `gain` - A linear gain for the filter.
+    /// * `delay` - A delay to apply, in number of samples.
+    /// * `biquads` - The biquads to apply when running the filter.
     pub fn new(gain: f32, delay: usize, biquads: &[DirectForm2Transposed<f32>]) -> Self {
         let mut filter = Filter {
             gain,
@@ -143,12 +152,18 @@ impl Filter {
             biquads: Vec::from_slice(biquads).unwrap(),
         };
 
-        if delay > filter.delay_line.capacity() {
-            panic!("Delay exceeds delay line capacity.");
+        // Panics, if `delay` exceeds the delay vector length.
+        for _ in 0..delay {
+            filter.delay_line.push(0.0f32).unwrap();
         }
 
-        filter.delay_line.fill(0.0f32);
-        filter.delay_line.truncate(delay);
+        info!(
+            "Filter has {}/{} biquads with {}/{} samples of delay.",
+            filter.biquads.len(),
+            filter.biquads.capacity(),
+            filter.delay_line.len(),
+            filter.delay_line.capacity()
+        );
 
         filter
     }
@@ -158,8 +173,9 @@ impl Filter {
         for biquad in &mut self.biquads {
             sample = biquad.run(sample)
         }
+        sample = sample * self.gain;
 
-        self.delay_line.push(sample * self.gain).unwrap();
+        self.delay_line.push(sample).unwrap();
         self.delay_line.pop().unwrap()
     }
 }
