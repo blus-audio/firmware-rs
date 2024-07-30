@@ -413,7 +413,7 @@ async fn main(spawner: Spawner) {
             source: PllSource::HSE,
             prediv: PllPreDiv::DIV4,
             mul: PllMul::MUL80,
-            divp: Some(PllDiv::DIV4),  // 122.88 MHz
+            divp: Some(PllDiv::DIV2),  // 245.76 MHz
             divq: Some(PllDiv::DIV20), // 24.576 MHz for SAI4
             divr: Some(PllDiv::DIV2),  // 245.76 MHz
         });
@@ -437,7 +437,7 @@ async fn main(spawner: Spawner) {
         // 1 (<= 400 MHz)
         // 2 (<= 300 MHz)
         // 3 (<= 170 MHz)
-        peripheral_config.rcc.voltage_scale = VoltageScale::Scale3;
+        peripheral_config.rcc.voltage_scale = VoltageScale::Scale2;
         peripheral_config.rcc.mux.usbsel = mux::Usbsel::PLL3_Q;
         peripheral_config.rcc.mux.sai1sel = mux::Saisel::PLL1_Q;
         peripheral_config.rcc.mux.adcsel = mux::Adcsel::PLL3_R;
