@@ -359,26 +359,28 @@ async fn volume_control_task(
             Either::First(_measured) => (),
             Either::Second(_) => {
                 status_led.set_high();
-                let audio_channel_settings = control_changed.audio_settings();
 
                 let volume_left: u8;
-                if audio_channel_settings.is_muted[0] {
+                if control_changed.is_muted(uac1::Channel::LeftFront).unwrap() {
                     volume_left = tas2780::MUTE_VOLUME;
                 } else {
-                    volume_left = attenuation_8q8_db_to_tas2780(audio_channel_settings.volume_8q8_db[0]);
+                    volume_left =
+                        attenuation_8q8_db_to_tas2780(control_changed.volume_8q8_db(uac1::Channel::LeftFront).unwrap());
                 }
 
                 let volume_right: u8;
-                if audio_channel_settings.is_muted[0] {
+                if control_changed.is_muted(uac1::Channel::RightFront).unwrap() {
                     volume_right = tas2780::MUTE_VOLUME;
                 } else {
-                    volume_right = attenuation_8q8_db_to_tas2780(audio_channel_settings.volume_8q8_db[0]);
+                    volume_right = attenuation_8q8_db_to_tas2780(
+                        control_changed.volume_8q8_db(uac1::Channel::RightFront).unwrap(),
+                    );
                 }
 
                 VOLUME_ADC_SIGNAL.signal((volume_left, volume_right));
 
                 // Limit the rate of volume updates
-                Timer::after_millis(100).await;
+                Timer::after_millis(10).await;
                 status_led.set_low();
             }
         }
@@ -526,7 +528,7 @@ async fn main(spawner: Spawner) {
         USB_PACKET_SIZE as u16,
         uac1::SampleWidth::Width4Byte,
         &[SAMPLE_RATE_HZ],
-        &[uac1::ChannelConfig::LeftFront, uac1::ChannelConfig::RightFront],
+        &[uac1::Channel::LeftFront, uac1::Channel::RightFront],
         uac1::FeedbackRefreshPeriod::Period8ms,
     );
 
@@ -580,7 +582,7 @@ async fn main(spawner: Spawner) {
 
     unwrap!(spawner.spawn(heartbeat_task(led_red)));
     unwrap!(spawner.spawn(audio_routing_task(sai4_resources, receiver, led_blue)));
-    unwrap!(spawner.spawn(volume_control_task(adc_resources, control_changed, led_yellow)));
+    // unwrap!(spawner.spawn(volume_control_task(adc_resources, control_changed, led_yellow)));
     unwrap!(spawner.spawn(amplifier_task(amplifier_resources)));
 
     let receive_fut = async {
