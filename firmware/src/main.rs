@@ -46,15 +46,23 @@ unsafe fn UART4() {
     EXECUTOR_HIGH.on_interrupt()
 }
 
-const CHANNEL_COUNT: usize = 2;
+const INPUT_CHANNEL_COUNT: usize = 2;
+const OUTPUT_CHANNEL_COUNT: usize = 4;
 const SAMPLE_RATE_HZ: u32 = 48000;
-const SAMPLE_SIZE: usize = uac1::SampleWidth::Width4Byte as usize;
+
+const SAMPLE_WIDTH: uac1::SampleWidth = uac1::SampleWidth::Width4Byte;
+const SAMPLE_SIZE: usize = SAMPLE_WIDTH as usize;
+const SAMPLE_BIT_COUNT: usize = SAMPLE_WIDTH.in_bit();
+
+// Size of audio samples per 1 ms
+const AUDIO_SIZE_PER_MS: usize = (SAMPLE_RATE_HZ as usize / 1000) * INPUT_CHANNEL_COUNT * SAMPLE_SIZE;
 
 // Factor of two as a margin for feedback (excessive)
-const USB_PACKET_SIZE: usize = 2 * (SAMPLE_RATE_HZ as usize / 1000) * CHANNEL_COUNT * SAMPLE_SIZE;
+const USB_PACKET_SIZE: usize = 2 * AUDIO_SIZE_PER_MS;
 
 // Factor of two for being able to buffer two full USB packets (excessive)
-const DMA_BUFFER_SIZE: usize = 2 * USB_PACKET_SIZE;
+const SAI4A_BUFFER_SIZE: usize = 2 * USB_PACKET_SIZE;
+const _SAI4B_BUFFER_SIZE: usize = AUDIO_SIZE_PER_MS;
 
 const SAMPLE_COUNT: usize = USB_PACKET_SIZE / SAMPLE_SIZE;
 const SAMPLE_BLOCK_COUNT: usize = 2;
@@ -69,11 +77,11 @@ type SampleBlock = ([f32; SAMPLE_COUNT], usize);
 // Accessible by most system masters (Zone D2)
 #[link_section = ".sram1"]
 static mut ADC1_MEASUREMENT_BUFFER: GroundedArrayCell<u16, 1> = GroundedArrayCell::uninit();
-static mut _SAI1A_WRITE_BUFFER: GroundedArrayCell<u8, DMA_BUFFER_SIZE> = GroundedArrayCell::uninit();
 
 // Accessible by BDMA (Zone D3)
 #[link_section = ".sram4"]
-static mut SAI4A_WRITE_BUFFER: GroundedArrayCell<u32, DMA_BUFFER_SIZE> = GroundedArrayCell::uninit();
+static mut SAI4A_WRITE_BUFFER: GroundedArrayCell<u32, SAI4A_BUFFER_SIZE> = GroundedArrayCell::uninit();
+static mut _SAI4B_READ_BUFFER: GroundedArrayCell<u32, _SAI4B_BUFFER_SIZE> = GroundedArrayCell::uninit();
 
 #[allow(unused)]
 struct AmplifierResources {
@@ -118,46 +126,49 @@ async fn audio_routing_task(
         core::slice::from_raw_parts_mut(ptr, len)
     };
 
-    fn new_sai4a<'d>(
-        sai4_resources: &'d mut Sai4Resources,
-        sai4a_write_buffer: &'d mut [u32],
+    let _sai4b_read_buffer: &mut [u32] = unsafe {
+        _SAI4B_READ_BUFFER.initialize_all_copied(0);
+        let (ptr, len) = _SAI4B_READ_BUFFER.get_ptr_len();
+        core::slice::from_raw_parts_mut(ptr, len)
+    };
+
+    fn new_sai4<'d>(
+        resources: &'d mut Sai4Resources,
+        write_buffer: &'d mut [u32],
         sample_rate_hz: u32,
     ) -> sai::Sai<'d, peripherals::SAI4, u32> {
-        let mut sai4a_config = sai::Config::default();
+        let (sai4a, _sai4b) = sai::split_subblocks(&mut resources.sai);
 
-        sai4a_config.slot_count = sai::word::U4(4);
-        sai4a_config.slot_enable = 0xFFFF; // All slots
-        sai4a_config.data_size = sai::DataSize::Data32;
-        sai4a_config.frame_sync_offset = sai::FrameSyncOffset::OnFirstBit;
-        sai4a_config.frame_sync_active_level_length = sai::word::U7(1);
-        sai4a_config.frame_sync_definition = sai::FrameSyncDefinition::StartOfFrame;
-        sai4a_config.frame_length = 4 * 32;
-        sai4a_config.clock_strobe = sai::ClockStrobe::Rising;
-        sai4a_config.bit_order = sai::BitOrder::MsbFirst;
+        let sai4a = {
+            let mut config = sai::Config::default();
 
-        match sample_rate_hz {
-            SAMPLE_RATE_HZ => sai4a_config.master_clock_divider = sai::MasterClockDivider::Div2,
-            _ => panic!("Unsupported SAI sample rate."),
-        }
+            config.slot_count = sai::word::U4(OUTPUT_CHANNEL_COUNT as u8);
+            config.slot_enable = 0xFFFF; // All slots
+            config.data_size = sai::DataSize::Data32;
+            config.frame_sync_definition = sai::FrameSyncDefinition::StartOfFrame;
+            config.frame_length = (OUTPUT_CHANNEL_COUNT * SAMPLE_BIT_COUNT) as u8;
+            config.bit_order = sai::BitOrder::MsbFirst;
 
-        let _sai4b_config = sai::Config::default();
+            match sample_rate_hz {
+                SAMPLE_RATE_HZ => config.master_clock_divider = sai::MasterClockDivider::Div2,
+                _ => panic!("Unsupported SAI sample rate."),
+            }
 
-        let (sai4a, _sai4b) = sai::split_subblocks(&mut sai4_resources.sai);
+            sai::Sai::new_asynchronous(
+                sai4a,
+                &mut resources.sck_a,
+                &mut resources.sd_a,
+                &mut resources.fs_a,
+                &mut resources.dma_a,
+                write_buffer,
+                config,
+            )
+        };
 
-        let sai4a_driver = sai::Sai::new_asynchronous(
-            sai4a,
-            &mut sai4_resources.sck_a,
-            &mut sai4_resources.sd_a,
-            &mut sai4_resources.fs_a,
-            &mut sai4_resources.dma_a,
-            sai4a_write_buffer,
-            sai4a_config,
-        );
-
-        sai4a_driver
+        sai4a
     }
 
-    let mut sai4a_driver = new_sai4a(&mut sai4_resources, sai4a_write_buffer, SAMPLE_RATE_HZ);
+    let mut sai4a_driver = new_sai4(&mut sai4_resources, sai4a_write_buffer, SAMPLE_RATE_HZ);
     sai4a_driver.start();
 
     let (mut filter_a, mut filter_b, mut filter_c, mut filter_d) = filter::get_filters(SAMPLE_RATE_HZ.hz());
@@ -199,7 +210,7 @@ async fn audio_routing_task(
             info!("Renew SAI setup.");
 
             drop(sai4a_driver);
-            sai4a_driver = new_sai4a(&mut sai4_resources, sai4a_write_buffer, SAMPLE_RATE_HZ);
+            sai4a_driver = new_sai4(&mut sai4_resources, sai4a_write_buffer, SAMPLE_RATE_HZ);
             sai4a_driver.start();
 
             SAI_ACTIVE_SIGNAL.signal(true);

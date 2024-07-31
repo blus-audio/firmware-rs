@@ -276,8 +276,6 @@ where
             }
         }
 
-        let tdm_cfg1 = 0; // RX_OFFSET = 0
-        self.write_register(0x09, tdm_cfg1);
         self.write_register(0x0A, tdm_cfg2);
         self.write_register(0x0C, tdm_cfg3);
 
