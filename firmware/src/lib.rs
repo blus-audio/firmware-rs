@@ -1,4 +1,4 @@
 #![no_std]
 
-pub mod filters;
+pub mod audio;
 pub mod tas2780;

@@ -1,13 +1,29 @@
 use biquad::*;
-use defmt::info;
-use heapless::Vec;
 use micromath::F32Ext;
+
+type B = DirectForm2Transposed<f32>;
+type C = Coefficients<f32>;
 
 const MAX_DELAY_LENGTH: usize = 32;
 const MAX_BIQUAD_COUNT: usize = 10;
 
-type B = DirectForm2Transposed<f32>;
-type C = Coefficients<f32>;
+const Q31_SCALING_FACTOR: f32 = 2147483648.0;
+
+fn clip_q63_to_q31(sample: i64) -> i32 {
+    if (sample >> 32) as i32 != (sample as i32) >> 31 {
+        0x7FFFFFFF ^ ((sample >> 63) as i32)
+    } else {
+        sample as i32
+    }
+}
+
+pub fn sample_as_u32(sample: f32) -> u32 {
+    clip_q63_to_q31((sample * Q31_SCALING_FACTOR) as i64) as u32
+}
+
+pub fn sample_as_f32(sample: u32) -> f32 {
+    (sample as i32 as f32) / Q31_SCALING_FACTOR
+}
 
 pub fn get_filters(fs: Hertz<f32>) -> (Filter, Filter, Filter, Filter) {
     let f_co = 1800.hz();
@@ -132,6 +148,7 @@ pub fn get_filters(fs: Hertz<f32>) -> (Filter, Filter, Filter, Filter) {
         }),
     ];
 
+    // Negative gain inverts a channel.
     let gain_a = -10.0f32.powf(-10.0 / 20.0);
     let gain_b = 10.0f32.powf(-11.5 / 20.0);
     let gain_c = -10.0f32.powf(-10.0 / 20.0);
@@ -150,11 +167,49 @@ pub fn get_filters(fs: Hertz<f32>) -> (Filter, Filter, Filter, Filter) {
     (f_a, f_b, f_c, f_d)
 }
 
+struct Delay {
+    read_index: usize,
+    write_index: usize,
+    length: usize,
+    delay_line: [f32; MAX_DELAY_LENGTH + 1],
+}
+
+impl Delay {
+    /// Create a new delay instance with a given delay length in number of samples.
+    fn new(length: usize) -> Self {
+        if length > MAX_DELAY_LENGTH {
+            panic!("Delay exceeds maximum allowed delay.");
+        }
+        Delay {
+            write_index: length,
+            read_index: 0,
+            length,
+            delay_line: [0.0f32; MAX_DELAY_LENGTH + 1],
+        }
+    }
+
+    /// Increments read and write positions in a circular way.
+    fn increment(&mut self) {
+        for index in [&mut self.read_index, &mut self.write_index] {
+            *index += 1;
+            if *index >= self.length {
+                *index = 0;
+            }
+        }
+    }
+
+    /// Consume a sample, and give back a delayed sample.
+    fn tick(&mut self, sample: f32) -> f32 {
+        self.increment();
+
+        self.delay_line[self.write_index] = sample;
+        self.delay_line[self.read_index]
+    }
+}
+
 pub struct Filter {
     gain: f32,
-    /// For applying delay, a sample is first pushed, then the oldest one popped.
-    /// After pushing, there is one more sample in the delay line than the delay is long.
-    delay_line: Vec<f32, { MAX_DELAY_LENGTH + 1 }>,
+    delay: Delay,
     biquads: [B; MAX_BIQUAD_COUNT],
 }
 
@@ -164,38 +219,23 @@ impl Filter {
     /// # Arguments
     ///
     /// * `gain` - A linear gain for the filter.
-    /// * `delay` - A delay to apply, in number of samples.
+    /// * `delay_length` - A delay to apply, in number of samples.
     /// * `biquads` - The biquads to apply when running the filter.
-    pub fn new(gain: f32, delay: usize, biquads: [B; MAX_BIQUAD_COUNT]) -> Self {
-        let mut filter = Filter {
+    pub fn new(gain: f32, delay_length: usize, biquads: [B; MAX_BIQUAD_COUNT]) -> Self {
+        Filter {
             gain,
-            delay_line: Vec::new(),
+            delay: Delay::new(delay_length),
             biquads,
-        };
-
-        // Panics, if `delay` exceeds the delay vector length.
-        for _ in 0..delay {
-            filter.delay_line.push(0.0f32).unwrap();
         }
-
-        info!(
-            "Filter has {} biquads with {}/{} samples of delay.",
-            filter.biquads.len(),
-            filter.delay_line.len(),
-            filter.delay_line.capacity()
-        );
-
-        filter
     }
 
-    /// Run the filter on a sample.
+    /// Run the filter on a provided sample.
     pub fn run(&mut self, mut sample: f32) -> f32 {
         for biquad in self.biquads.as_mut() {
             sample = biquad.run(sample);
         }
         sample = sample * self.gain;
 
-        self.delay_line.push(sample).unwrap();
-        self.delay_line.pop().unwrap()
+        self.delay.tick(sample)
     }
 }
