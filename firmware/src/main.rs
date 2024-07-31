@@ -4,7 +4,8 @@
 use core::cell::RefCell;
 
 use biquad::ToHertz;
-use blus_fw::{audio, tas2780};
+use blus_fw::audio;
+use blus_fw::{audio::filter, tas2780};
 use cortex_m_rt::entry;
 use defmt::{info, panic, unwrap};
 use embassy_embedded_hal::shared_bus::blocking::i2c::I2cDevice;
@@ -159,7 +160,7 @@ async fn audio_routing_task(
     let mut sai4a_driver = new_sai4a(&mut sai4_resources, sai4a_write_buffer, SAMPLE_RATE_HZ);
     sai4a_driver.start();
 
-    let (mut filter_a, mut filter_b, mut filter_c, mut filter_d) = audio::get_filters(SAMPLE_RATE_HZ.hz());
+    let (mut filter_a, mut filter_b, mut filter_c, mut filter_d) = filter::get_filters(SAMPLE_RATE_HZ.hz());
 
     loop {
         let (samples, sample_count) = receiver.receive().await;
@@ -181,10 +182,10 @@ async fn audio_routing_task(
             let sample_c = filter_c.run(sample_c);
             let sample_d = filter_d.run(sample_d);
 
-            samples_u32.push(audio::sample_as_u32(sample_a)).unwrap();
-            samples_u32.push(audio::sample_as_u32(sample_b)).unwrap();
-            samples_u32.push(audio::sample_as_u32(sample_c)).unwrap();
-            samples_u32.push(audio::sample_as_u32(sample_d)).unwrap();
+            samples_u32.push(audio::sample_to_u32(sample_a)).unwrap();
+            samples_u32.push(audio::sample_to_u32(sample_b)).unwrap();
+            samples_u32.push(audio::sample_to_u32(sample_c)).unwrap();
+            samples_u32.push(audio::sample_to_u32(sample_d)).unwrap();
         }
         status_led.set_low();
 
@@ -659,7 +660,7 @@ async fn stream_handler<'d, T: usb::Instance + 'd>(
 
             for w in 0..word_count {
                 let byte_offset = w * SAMPLE_SIZE;
-                let sample = audio::sample_as_f32(u32::from_le_bytes(
+                let sample = audio::sample_to_f32(u32::from_le_bytes(
                     usb_data[byte_offset..byte_offset + SAMPLE_SIZE].try_into().unwrap(),
                 ));
 

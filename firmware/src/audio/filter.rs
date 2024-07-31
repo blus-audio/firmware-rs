@@ -7,24 +7,6 @@ type C = Coefficients<f32>;
 const MAX_DELAY_LENGTH: usize = 32;
 const MAX_BIQUAD_COUNT: usize = 10;
 
-const Q31_SCALING_FACTOR: f32 = 2147483648.0;
-
-fn clip_q63_to_q31(sample: i64) -> i32 {
-    if (sample >> 32) as i32 != (sample as i32) >> 31 {
-        0x7FFFFFFF ^ ((sample >> 63) as i32)
-    } else {
-        sample as i32
-    }
-}
-
-pub fn sample_as_u32(sample: f32) -> u32 {
-    clip_q63_to_q31((sample * Q31_SCALING_FACTOR) as i64) as u32
-}
-
-pub fn sample_as_f32(sample: u32) -> f32 {
-    (sample as i32 as f32) / Q31_SCALING_FACTOR
-}
-
 pub fn get_filters(fs: Hertz<f32>) -> (Filter, Filter, Filter, Filter) {
     let f_co = 1800.hz();
     let biquads_a = [
