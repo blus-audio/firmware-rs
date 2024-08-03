@@ -1,5 +1,5 @@
-//! A driver for the TAS2780 class-D amplifier.
-use defmt::trace;
+//! A driver for controlling the TAS2780 class-D amplifier.
+use defmt::debug;
 use embassy_time::Timer;
 use embedded_hal_1::i2c;
 
@@ -224,7 +224,7 @@ where
 
     /// Initialize a TAS2780 amplifier to default settings.
     pub async fn init(&mut self) {
-        trace!("Initializing TAS2780 at address {}.", self.address);
+        debug!("Initializing TAS2780 at address {}.", self.address);
 
         // Pre-reset configuration (as per the datasheet)
         self.set_page(0x01);
@@ -281,7 +281,7 @@ where
 
         // Set up the noise gate, if enabled
         if let Some(noise_gate) = self.noise_gate {
-            trace!("Enable TAS2780 noise gate.");
+            debug!("Enable TAS2780 noise gate.");
             const ENABLE_NOISE_GATE: u8 = 0b1;
 
             self.write_register(

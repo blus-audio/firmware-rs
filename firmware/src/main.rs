@@ -3,21 +3,19 @@
 
 use core::cell::RefCell;
 
-use biquad::ToHertz;
-use blus_fw::audio;
-use blus_fw::{audio::filter, tas2780};
-use cortex_m_rt::entry;
-use defmt::{info, panic, unwrap};
+use blus_fw::*;
+
+use defmt::{info, unwrap};
 use embassy_embedded_hal::shared_bus::blocking::i2c::I2cDevice;
-use embassy_executor::{Executor, InterruptExecutor};
-use embassy_futures::join::{join, join3};
+use embassy_executor::Spawner;
+use embassy_futures::join::join;
 use embassy_futures::select::{select, Either};
 use embassy_stm32::adc::{self, AdcChannel};
 use embassy_stm32::gpio::{Input, Level, Output, Pull, Speed};
 use embassy_stm32::interrupt;
-use embassy_stm32::interrupt::{InterruptExt, Priority};
 use embassy_stm32::mode::Async;
 use embassy_stm32::time::Hertz;
+use embassy_stm32::timer;
 use embassy_stm32::{bind_interrupts, i2c, peripherals, usb};
 use embassy_sync::blocking_mutex::raw::{NoopRawMutex, ThreadModeRawMutex};
 use embassy_sync::blocking_mutex::NoopMutex;
@@ -26,7 +24,6 @@ use embassy_sync::zerocopy_channel;
 use embassy_time::{Duration, Ticker, Timer};
 use embassy_usb::class::uac1;
 use embassy_usb::class::uac1::speaker::{self, Speaker};
-use embassy_usb::driver::EndpointError;
 use grounded::uninit::GroundedArrayCell;
 use heapless::Vec;
 use static_cell::StaticCell;
@@ -38,50 +35,13 @@ bind_interrupts!(struct Irqs {
     I2C1_ER => i2c::ErrorInterruptHandler<peripherals::I2C1>;
 });
 
-static EXECUTOR_HIGH: InterruptExecutor = InterruptExecutor::new();
-static EXECUTOR_LOW: StaticCell<Executor> = StaticCell::new();
-
-#[interrupt]
-unsafe fn UART4() {
-    EXECUTOR_HIGH.on_interrupt()
-}
-
-const INPUT_CHANNEL_COUNT: usize = 2;
-const OUTPUT_CHANNEL_COUNT: usize = 4;
-const SAMPLE_RATE_HZ: u32 = 48000;
-
-const SAMPLE_WIDTH: uac1::SampleWidth = uac1::SampleWidth::Width4Byte;
-const SAMPLE_SIZE: usize = SAMPLE_WIDTH as usize;
-const SAMPLE_BIT_COUNT: usize = SAMPLE_WIDTH.in_bit();
-
-// Size of audio samples per 1 ms
-const AUDIO_SIZE_PER_MS: usize = (SAMPLE_RATE_HZ as usize / 1000) * INPUT_CHANNEL_COUNT * SAMPLE_SIZE;
-
-// Factor of two as a margin for feedback (excessive)
-const USB_PACKET_SIZE: usize = 2 * AUDIO_SIZE_PER_MS;
-
-// Factor of two for being able to buffer two full USB packets (excessive)
-const SAI4A_BUFFER_SIZE: usize = 2 * USB_PACKET_SIZE;
-const _SAI4B_BUFFER_SIZE: usize = AUDIO_SIZE_PER_MS;
-
-const SAMPLE_COUNT: usize = USB_PACKET_SIZE / SAMPLE_SIZE;
-const SAMPLE_BLOCK_COUNT: usize = 2;
-
-static SAI_ACTIVE_SIGNAL: Signal<ThreadModeRawMutex, bool> = Signal::new();
 static VOLUME_ADC_SIGNAL: Signal<ThreadModeRawMutex, (u8, u8)> = Signal::new();
 
 static I2C_BUS: StaticCell<NoopMutex<RefCell<i2c::I2c<'static, Async>>>> = StaticCell::new();
 
-type SampleBlock = ([f32; SAMPLE_COUNT], usize);
-
 // Accessible by most system masters (Zone D2)
 #[link_section = ".sram1"]
 static mut ADC1_MEASUREMENT_BUFFER: GroundedArrayCell<u16, 1> = GroundedArrayCell::uninit();
-
-// Accessible by BDMA (Zone D3)
-#[link_section = ".sram4"]
-static mut SAI4A_WRITE_BUFFER: GroundedArrayCell<u32, SAI4A_BUFFER_SIZE> = GroundedArrayCell::uninit();
-static mut _SAI4B_READ_BUFFER: GroundedArrayCell<u32, _SAI4B_BUFFER_SIZE> = GroundedArrayCell::uninit();
 
 #[allow(unused)]
 struct AmplifierResources {
@@ -97,125 +57,154 @@ struct AdcResources<T: adc::Instance> {
     dma: peripherals::DMA1_CH0,
 }
 
-#[allow(unused)]
-struct Sai4Resources {
-    sai: peripherals::SAI4,
+pub fn get_filters() -> (AudioFilter, AudioFilter, AudioFilter, AudioFilter) {
+    use biquad::*;
+    use micromath::F32Ext;
 
-    sck_a: peripherals::PD13,
-    sd_a: peripherals::PC1,
-    fs_a: peripherals::PD12,
-    dma_a: peripherals::BDMA_CH0,
+    type B = BiquadType;
+    type C = Coefficients<f32>;
 
-    sck_b: peripherals::PE12,
-    sd_b: peripherals::PE11,
-    fs_b: peripherals::PE13,
-    dma_b: peripherals::BDMA_CH1,
-}
+    let f_co = 1800.hz();
+    let fs = SAMPLE_RATE_HZ.hz();
 
-#[embassy_executor::task]
-async fn audio_routing_task(
-    mut sai4_resources: Sai4Resources,
-    mut receiver: zerocopy_channel::Receiver<'static, NoopRawMutex, SampleBlock>,
-    mut status_led: Output<'static>,
-) {
-    use embassy_stm32::sai;
+    let biquads_a = [
+        B::new(C::from_params(Type::AllPass, fs, f_co, 0.6).unwrap()),
+        B::new(C {
+            a1: -1.9925941047116,
+            a2: 0.992621419175639,
+            b0: 1.00200843380849,
+            b1: -1.99256829254308,
+            b2: 0.990638797535668,
+        }),
+        B::new(C::from_params(Type::PeakingEQ(-2.5), fs, 660.hz(), 2.5).unwrap()),
+        B::new(C::from_params(Type::PeakingEQ(1.0), fs, 880.hz(), 2.0).unwrap()),
+        B::new(C::from_params(Type::HighShelf(-8.0), fs, 1200.hz(), 0.35).unwrap()),
+        B::new(C::from_params(Type::PeakingEQ(-2.5), fs, 1300.hz(), 2.0).unwrap()),
+        B::new(C::from_params(Type::PeakingEQ(-3.0), fs, 3450.hz(), 2.0).unwrap()),
+        B::new(C::from_params(Type::LowPass, fs, f_co, Q_BUTTERWORTH_F32).unwrap()),
+        B::new(C::from_params(Type::LowPass, fs, f_co, Q_BUTTERWORTH_F32).unwrap()),
+        B::new(C {
+            a1: 0.0,
+            a2: 0.0,
+            b0: 1.0,
+            b1: 0.0,
+            b2: 0.0,
+        }),
+    ];
+    let biquads_c = [
+        B::new(C::from_params(Type::AllPass, fs, f_co, 0.6).unwrap()),
+        B::new(C {
+            a1: -1.9925941047116,
+            a2: 0.992621419175639,
+            b0: 1.00200843380849,
+            b1: -1.99256829254308,
+            b2: 0.990638797535668,
+        }),
+        B::new(C::from_params(Type::PeakingEQ(-2.5), fs, 660.hz(), 2.5).unwrap()),
+        B::new(C::from_params(Type::PeakingEQ(1.0), fs, 880.hz(), 2.0).unwrap()),
+        B::new(C::from_params(Type::HighShelf(-8.0), fs, 1200.hz(), 0.35).unwrap()),
+        B::new(C::from_params(Type::PeakingEQ(-2.5), fs, 1300.hz(), 2.0).unwrap()),
+        B::new(C::from_params(Type::PeakingEQ(-3.0), fs, 3450.hz(), 2.0).unwrap()),
+        B::new(C::from_params(Type::LowPass, fs, f_co, Q_BUTTERWORTH_F32).unwrap()),
+        B::new(C::from_params(Type::LowPass, fs, f_co, Q_BUTTERWORTH_F32).unwrap()),
+        B::new(C {
+            a1: 0.0,
+            a2: 0.0,
+            b0: 1.0,
+            b1: 0.0,
+            b2: 0.0,
+        }),
+    ];
+    let biquads_b = [
+        B::new(C::from_params(Type::PeakingEQ(-9.0), fs, 1700.hz(), 0.3).unwrap()),
+        B::new(C::from_params(Type::PeakingEQ(1.0), fs, 7700.hz(), 2.0).unwrap()),
+        B::new(C::from_params(Type::PeakingEQ(-1.0), fs, 12000.hz(), 2.0).unwrap()),
+        B::new(C::from_params(Type::PeakingEQ(6.0), fs, 18000.hz(), 0.6).unwrap()),
+        B::new(C::from_params(Type::HighPass, fs, f_co, Q_BUTTERWORTH_F32).unwrap()),
+        B::new(C::from_params(Type::HighPass, fs, f_co, Q_BUTTERWORTH_F32).unwrap()),
+        B::new(C {
+            a1: 0.0,
+            a2: 0.0,
+            b0: 1.0,
+            b1: 0.0,
+            b2: 0.0,
+        }),
+        B::new(C {
+            a1: 0.0,
+            a2: 0.0,
+            b0: 1.0,
+            b1: 0.0,
+            b2: 0.0,
+        }),
+        B::new(C {
+            a1: 0.0,
+            a2: 0.0,
+            b0: 1.0,
+            b1: 0.0,
+            b2: 0.0,
+        }),
+        B::new(C {
+            a1: 0.0,
+            a2: 0.0,
+            b0: 1.0,
+            b1: 0.0,
+            b2: 0.0,
+        }),
+    ];
+    let biquads_d = [
+        B::new(C::from_params(Type::PeakingEQ(-9.0), fs, 1700.hz(), 0.3).unwrap()),
+        B::new(C::from_params(Type::PeakingEQ(1.0), fs, 7700.hz(), 2.0).unwrap()),
+        B::new(C::from_params(Type::PeakingEQ(-1.0), fs, 12000.hz(), 2.0).unwrap()),
+        B::new(C::from_params(Type::PeakingEQ(6.0), fs, 18000.hz(), 0.6).unwrap()),
+        B::new(C::from_params(Type::HighPass, fs, f_co, Q_BUTTERWORTH_F32).unwrap()),
+        B::new(C::from_params(Type::HighPass, fs, f_co, Q_BUTTERWORTH_F32).unwrap()),
+        B::new(C {
+            a1: 0.0,
+            a2: 0.0,
+            b0: 1.0,
+            b1: 0.0,
+            b2: 0.0,
+        }),
+        B::new(C {
+            a1: 0.0,
+            a2: 0.0,
+            b0: 1.0,
+            b1: 0.0,
+            b2: 0.0,
+        }),
+        B::new(C {
+            a1: 0.0,
+            a2: 0.0,
+            b0: 1.0,
+            b1: 0.0,
+            b2: 0.0,
+        }),
+        B::new(C {
+            a1: 0.0,
+            a2: 0.0,
+            b0: 1.0,
+            b1: 0.0,
+            b2: 0.0,
+        }),
+    ];
 
-    let sai4a_write_buffer: &mut [u32] = unsafe {
-        SAI4A_WRITE_BUFFER.initialize_all_copied(0);
-        let (ptr, len) = SAI4A_WRITE_BUFFER.get_ptr_len();
-        core::slice::from_raw_parts_mut(ptr, len)
-    };
+    // Negative gain inverts a channel.
+    let gain_a = -10.0f32.powf(-10.0 / 20.0);
+    let gain_b = 10.0f32.powf(-11.5 / 20.0);
+    let gain_c = -10.0f32.powf(-10.0 / 20.0);
+    let gain_d = 10.0f32.powf(-11.5 / 20.0);
 
-    let _sai4b_read_buffer: &mut [u32] = unsafe {
-        _SAI4B_READ_BUFFER.initialize_all_copied(0);
-        let (ptr, len) = _SAI4B_READ_BUFFER.get_ptr_len();
-        core::slice::from_raw_parts_mut(ptr, len)
-    };
+    let delay_a: usize = 0;
+    let delay_b: usize = 6;
+    let delay_c: usize = 0;
+    let delay_d: usize = 6;
 
-    fn new_sai4<'d>(
-        resources: &'d mut Sai4Resources,
-        write_buffer: &'d mut [u32],
-        sample_rate_hz: u32,
-    ) -> sai::Sai<'d, peripherals::SAI4, u32> {
-        let (sai4a, _sai4b) = sai::split_subblocks(&mut resources.sai);
+    let f_a = AudioFilter::new(gain_a, delay_a, biquads_a);
+    let f_b = AudioFilter::new(gain_b, delay_b, biquads_b);
+    let f_c = AudioFilter::new(gain_c, delay_c, biquads_c);
+    let f_d = AudioFilter::new(gain_d, delay_d, biquads_d);
 
-        let sai4a = {
-            let mut config = sai::Config::default();
-
-            config.slot_count = sai::word::U4(OUTPUT_CHANNEL_COUNT as u8);
-            config.slot_enable = 0xFFFF; // All slots
-            config.data_size = sai::DataSize::Data32;
-            config.frame_sync_definition = sai::FrameSyncDefinition::StartOfFrame;
-            config.frame_length = (OUTPUT_CHANNEL_COUNT * SAMPLE_BIT_COUNT) as u8;
-            config.bit_order = sai::BitOrder::MsbFirst;
-
-            match sample_rate_hz {
-                SAMPLE_RATE_HZ => config.master_clock_divider = sai::MasterClockDivider::Div2,
-                _ => panic!("Unsupported SAI sample rate."),
-            }
-
-            sai::Sai::new_asynchronous(
-                sai4a,
-                &mut resources.sck_a,
-                &mut resources.sd_a,
-                &mut resources.fs_a,
-                &mut resources.dma_a,
-                write_buffer,
-                config,
-            )
-        };
-
-        sai4a
-    }
-
-    let mut sai4a_driver = new_sai4(&mut sai4_resources, sai4a_write_buffer, SAMPLE_RATE_HZ);
-    sai4a_driver.start();
-
-    let (mut filter_a, mut filter_b, mut filter_c, mut filter_d) = filter::get_filters(SAMPLE_RATE_HZ.hz());
-
-    loop {
-        let (samples, sample_count) = receiver.receive().await;
-
-        let mut samples_u32: Vec<u32, { 2 * SAMPLE_COUNT }> = Vec::new();
-
-        status_led.set_high();
-        for index in 0..*sample_count / 2 {
-            let sample_left = samples[2 * index];
-            let sample_right = samples[2 * index + 1];
-
-            let sample_a = sample_left;
-            let sample_b = sample_left;
-            let sample_c = sample_right;
-            let sample_d = sample_right;
-
-            let sample_a = filter_a.run(sample_a);
-            let sample_b = filter_b.run(sample_b);
-            let sample_c = filter_c.run(sample_c);
-            let sample_d = filter_d.run(sample_d);
-
-            samples_u32.push(audio::sample_to_u32(sample_a)).unwrap();
-            samples_u32.push(audio::sample_to_u32(sample_b)).unwrap();
-            samples_u32.push(audio::sample_to_u32(sample_c)).unwrap();
-            samples_u32.push(audio::sample_to_u32(sample_d)).unwrap();
-        }
-        status_led.set_low();
-
-        let result = sai4a_driver.write(&samples_u32[..*sample_count * 2]).await;
-
-        // Notify the channel that the buffer is now ready to be reused
-        receiver.receive_done();
-
-        if let Err(_) = result {
-            SAI_ACTIVE_SIGNAL.signal(false);
-            info!("Renew SAI setup.");
-
-            drop(sai4a_driver);
-            sai4a_driver = new_sai4(&mut sai4_resources, sai4a_write_buffer, SAMPLE_RATE_HZ);
-            sai4a_driver.start();
-
-            SAI_ACTIVE_SIGNAL.signal(true);
-        }
-    }
+    (f_a, f_b, f_c, f_d)
 }
 
 #[embassy_executor::task]
@@ -397,36 +386,10 @@ async fn heartbeat_task(mut status_led: Output<'static>) {
     }
 }
 
-#[embassy_executor::task]
-async fn usb_task(
-    mut stream: speaker::Stream<'static, usb::Driver<'static, peripherals::USB_OTG_HS>>,
-    mut feedback: speaker::Feedback<'static, usb::Driver<'static, peripherals::USB_OTG_HS>>,
-    mut sender: zerocopy_channel::Sender<'static, NoopRawMutex, SampleBlock>,
-    mut usb_device: embassy_usb::UsbDevice<'static, usb::Driver<'static, peripherals::USB_OTG_HS>>,
-) {
-    let feedback_fut = async {
-        loop {
-            feedback.wait_connection().await;
-            _ = feedback_handler(&mut feedback).await;
-        }
-    };
+#[embassy_executor::main]
+async fn main(spawner: Spawner) {
+    info!("Hi.");
 
-    let stream_fut = async {
-        loop {
-            stream.wait_connection().await;
-
-            info!("Stream connected");
-            _ = stream_handler(&mut stream, &mut sender).await;
-            info!("Stream disconnected");
-        }
-    };
-
-    // Run everything concurrently.
-    join3(usb_device.run(), feedback_fut, stream_fut).await;
-}
-
-#[entry]
-fn main() -> ! {
     let mut peripheral_config = embassy_stm32::Config::default();
     {
         // Uses a 24.576 MHz external oscillator.
@@ -482,7 +445,7 @@ fn main() -> ! {
         led.set_low();
     }
 
-    info!("USB packet size: {} byte", USB_PACKET_SIZE);
+    info!("USB packet size is {} byte", USB_PACKET_SIZE);
     static CONFIG_DESCRIPTOR: StaticCell<[u8; 128]> = StaticCell::new();
     let config_descriptor = CONFIG_DESCRIPTOR.init([0; 128]);
 
@@ -566,12 +529,15 @@ fn main() -> ! {
     // Build and run the USB device
     let usb_device = builder.build();
 
-    let sai4_resources = Sai4Resources {
+    let sai4_resources = audio_routing::Sai4Resources {
         sai: p.SAI4,
+
+        mclk_a: p.PE0,
         sck_a: p.PD13,
         sd_a: p.PC1,
         fs_a: p.PD12,
         dma_a: p.BDMA_CH0,
+
         sck_b: p.PE12,
         sd_b: p.PE11,
         fs_b: p.PE13,
@@ -600,90 +566,41 @@ fn main() -> ! {
     };
 
     // Establish a zero-copy channel for transferring received audio samples between tasks
-    static SAMPLE_BLOCKS: StaticCell<[SampleBlock; SAMPLE_BLOCK_COUNT]> = StaticCell::new();
-    let sample_blocks = SAMPLE_BLOCKS.init([([0.0; SAMPLE_COUNT], 0); SAMPLE_BLOCK_COUNT]);
+    static SAMPLE_BLOCKS: StaticCell<[SampleBlock; 2]> = StaticCell::new();
+    let sample_blocks = SAMPLE_BLOCKS.init([Vec::new(), Vec::new()]);
 
     static CHANNEL: StaticCell<zerocopy_channel::Channel<'_, NoopRawMutex, SampleBlock>> = StaticCell::new();
     let channel = CHANNEL.init(zerocopy_channel::Channel::new(sample_blocks));
     let (sender, receiver) = channel.split();
 
-    // let mut tim_2 = timer::low_level::Timer::new(p.TIM2);
-    // tim_2.set_trigger_source(timer::low_level::TriggerSource::ITR5);
+    // Trigger on timer 2 (internal signal)
+    // let tim1 = timer::low_level::Timer::new(p.TIM1);
+    // tim1.set_trigger_source(timer::low_level::TriggerSource::ITR1);
+    // tim1.start();
 
-    // High-priority executor: UART4, priority level 6
-    interrupt::UART4.set_priority(Priority::P6);
-    let _high_spawner = EXECUTOR_HIGH.start(interrupt::UART4);
+    // Trigger on USB SOF (internal signal)
+    // let mut tim2 = timer::low_level::Timer::new(p.TIM2);
+    // tim2.set_tick_freq(Hertz(24_576_000));
+    // tim2.set_trigger_source(timer::low_level::TriggerSource::ITR5);
+    // tim2.set_slave_mode(timer::low_level::SlaveMode::TRIGGER_MODE);
+    // tim2.regs_gp16().dier().modify(|r| r.set_tie(true));
+    // tim2.start();
 
-    // unwrap!(high_spawner.spawn(usb_task(stream, sender, usb_device)));
-    // unwrap!(high_spawner.spawn(audio_routing_task(sai4_resources, receiver, led_blue)));
+    // unsafe {
+    //     cortex_m::peripheral::NVIC::unmask(interrupt::TIM2);
+    // }
 
-    // Low priority executor: runs in thread mode, using WFE/SEV
-    let executor = EXECUTOR_LOW.init(Executor::new());
-    executor.run(|low_spawner| {
-        unwrap!(low_spawner.spawn(usb_task(stream, feedback, sender, usb_device)));
-        unwrap!(low_spawner.spawn(audio_routing_task(sai4_resources, receiver, led_blue)));
-        unwrap!(low_spawner.spawn(heartbeat_task(led_red)));
-        unwrap!(low_spawner.spawn(volume_control_task(adc_resources, control_changed, led_yellow)));
-        unwrap!(low_spawner.spawn(amplifier_task(amplifier_resources)));
-    });
+    unwrap!(spawner.spawn(usb_audio::usb_audio_task(stream, feedback, sender, usb_device)));
+    unwrap!(spawner.spawn(audio_routing::audio_routing_task(
+        get_filters(),
+        sai4_resources,
+        receiver,
+        led_blue
+    )));
+    unwrap!(spawner.spawn(heartbeat_task(led_red)));
+    unwrap!(spawner.spawn(volume_control_task(adc_resources, control_changed, led_yellow)));
+    unwrap!(spawner.spawn(amplifier_task(amplifier_resources)));
 }
 
-struct Disconnected {}
-
-impl From<EndpointError> for Disconnected {
-    fn from(val: EndpointError) -> Self {
-        match val {
-            EndpointError::BufferOverflow => panic!("Buffer overflow"),
-            EndpointError::Disabled => Disconnected {},
-        }
-    }
-}
-
-async fn feedback_handler<'d, T: usb::Instance + 'd>(
-    feedback: &mut speaker::Feedback<'d, usb::Driver<'d, T>>,
-) -> Result<(), Disconnected> {
-    // Measured number of samples per frame (1 ms).
-    let feedback_value: u32 = (SAMPLE_RATE_HZ / 1000) << 14;
-
-    let feedback_value = [
-        feedback_value as u8,
-        (feedback_value >> 8) as u8,
-        (feedback_value >> 16) as u8,
-    ];
-
-    loop {
-        feedback.write_packet(&feedback_value).await?;
-    }
-}
-
-async fn stream_handler<'d, T: usb::Instance + 'd>(
-    stream: &mut speaker::Stream<'d, usb::Driver<'d, T>>,
-    sender: &mut zerocopy_channel::Sender<'static, NoopRawMutex, SampleBlock>,
-) -> Result<(), Disconnected> {
-    loop {
-        let mut usb_data = [0u8; USB_PACKET_SIZE];
-        let data_size = stream.read_packet(&mut usb_data).await?;
-        let word_count = data_size / SAMPLE_SIZE;
-
-        if word_count * SAMPLE_SIZE == data_size {
-            // Obtain a free buffer from the channel
-            let (samples, sample_count) = sender.send().await;
-
-            for w in 0..word_count {
-                let byte_offset = w * SAMPLE_SIZE;
-                let sample = audio::sample_to_f32(u32::from_le_bytes(
-                    usb_data[byte_offset..byte_offset + SAMPLE_SIZE].try_into().unwrap(),
-                ));
-
-                // Fill the sample buffer with data.
-                samples[w] = sample;
-            }
-
-            *sample_count = word_count;
-
-            sender.send_done();
-        } else {
-            info!("Invalid USB buffer size of {}, skipped.", data_size);
-        }
-    }
-}
+#[interrupt]
+fn TIM2() {}
