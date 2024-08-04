@@ -17,8 +17,8 @@ use embassy_stm32::mode::Async;
 use embassy_stm32::time::Hertz;
 use embassy_stm32::timer;
 use embassy_stm32::{bind_interrupts, i2c, peripherals, usb};
-use embassy_sync::blocking_mutex::raw::{NoopRawMutex, ThreadModeRawMutex};
-use embassy_sync::blocking_mutex::NoopMutex;
+use embassy_sync::blocking_mutex::raw::{CriticalSectionRawMutex, NoopRawMutex, ThreadModeRawMutex};
+use embassy_sync::blocking_mutex::{Mutex, NoopMutex};
 use embassy_sync::signal::Signal;
 use embassy_sync::zerocopy_channel;
 use embassy_time::{Duration, Ticker, Timer};
@@ -37,6 +37,8 @@ bind_interrupts!(struct Irqs {
 
 static VOLUME_ADC_SIGNAL: Signal<ThreadModeRawMutex, (u8, u8)> = Signal::new();
 
+static TIMER: Mutex<CriticalSectionRawMutex, RefCell<Option<timer::low_level::Timer<peripherals::TIM2>>>> =
+    Mutex::new(RefCell::new(None));
 static I2C_BUS: StaticCell<NoopMutex<RefCell<i2c::I2c<'static, Async>>>> = StaticCell::new();
 
 // Accessible by most system masters (Zone D2)
@@ -523,7 +525,7 @@ async fn main(spawner: Spawner) {
         uac1::SampleWidth::Width4Byte,
         &[SAMPLE_RATE_HZ],
         &[uac1::Channel::LeftFront, uac1::Channel::RightFront],
-        uac1::FeedbackRefreshPeriod::Period8ms,
+        FEEDBACK_REFRESH_PERIOD,
     );
 
     // Build and run the USB device
@@ -573,22 +575,19 @@ async fn main(spawner: Spawner) {
     let channel = CHANNEL.init(zerocopy_channel::Channel::new(sample_blocks));
     let (sender, receiver) = channel.split();
 
-    // Trigger on timer 2 (internal signal)
-    // let tim1 = timer::low_level::Timer::new(p.TIM1);
-    // tim1.set_trigger_source(timer::low_level::TriggerSource::ITR1);
-    // tim1.start();
-
     // Trigger on USB SOF (internal signal)
-    // let mut tim2 = timer::low_level::Timer::new(p.TIM2);
-    // tim2.set_tick_freq(Hertz(24_576_000));
-    // tim2.set_trigger_source(timer::low_level::TriggerSource::ITR5);
-    // tim2.set_slave_mode(timer::low_level::SlaveMode::TRIGGER_MODE);
-    // tim2.regs_gp16().dier().modify(|r| r.set_tie(true));
-    // tim2.start();
+    let mut tim2 = timer::low_level::Timer::new(p.TIM2);
+    tim2.set_tick_freq(Hertz(24_576_000));
+    tim2.set_trigger_source(timer::low_level::TriggerSource::ITR5);
+    tim2.set_slave_mode(timer::low_level::SlaveMode::TRIGGER_MODE);
+    tim2.regs_gp16().dier().modify(|r| r.set_tie(true));
+    tim2.start();
 
-    // unsafe {
-    //     cortex_m::peripheral::NVIC::unmask(interrupt::TIM2);
-    // }
+    TIMER.lock(|p| p.borrow_mut().replace(tim2));
+
+    unsafe {
+        cortex_m::peripheral::NVIC::unmask(interrupt::TIM2);
+    }
 
     unwrap!(spawner.spawn(usb_audio::usb_audio_task(stream, feedback, sender, usb_device)));
     unwrap!(spawner.spawn(audio_routing::audio_routing_task(
@@ -603,4 +602,29 @@ async fn main(spawner: Spawner) {
 }
 
 #[interrupt]
-fn TIM2() {}
+fn TIM2() {
+    static mut LAST_TICKS: u32 = 0;
+    static mut FRAME_COUNT: usize = 0;
+
+    critical_section::with(|cs| {
+        // Read timer counter.
+        let ticks = TIMER.borrow(cs).borrow().as_ref().unwrap().regs_gp32().cnt().read();
+
+        // Clear trigger interrupt flag.
+        TIMER
+            .borrow(cs)
+            .borrow_mut()
+            .as_mut()
+            .unwrap()
+            .regs_gp32()
+            .sr()
+            .modify(|r| r.set_tif(false));
+
+        *FRAME_COUNT += 1;
+        if *FRAME_COUNT >= FEEDBACK_REFRESH_PERIOD.frame_count() {
+            *FRAME_COUNT = 0;
+            FEEDBACK_SIGNAL.signal(ticks - *LAST_TICKS);
+            *LAST_TICKS = ticks;
+        }
+    });
+}
