@@ -10,10 +10,10 @@ use embassy_sync::signal::Signal;
 use embassy_usb::class::uac1;
 use heapless::Vec;
 
-pub static SAI_ACTIVE_SIGNAL: Signal<ThreadModeRawMutex, bool> = Signal::new();
-
+// Stereo input -> two two-way speakers
 pub const INPUT_CHANNEL_COUNT: usize = 2;
 pub const OUTPUT_CHANNEL_COUNT: usize = 4;
+
 pub const SAMPLE_RATE_HZ: u32 = 48_000;
 pub const FEEDBACK_COUNTER_TICK_RATE: u32 = 24_576_000;
 
@@ -31,10 +31,12 @@ pub const SAMPLE_COUNT: usize = USB_PACKET_SIZE / SAMPLE_SIZE;
 // 4 ms for USB high-speed, 32 ms for USB full-speed.
 pub const FEEDBACK_REFRESH_PERIOD: uac1::FeedbackRefresh = uac1::FeedbackRefresh::Period32Frames;
 
+// Signals for task communication
+pub static SAI_ACTIVE_SIGNAL: Signal<ThreadModeRawMutex, bool> = Signal::new();
 pub static FEEDBACK_SIGNAL: Signal<CriticalSectionRawMutex, u32> = Signal::new();
 pub static VOLUME_SIGNAL: Signal<ThreadModeRawMutex, Vec<uac1::speaker::Volume, INPUT_CHANNEL_COUNT>> = Signal::new();
 
+// Type definitions
 pub type SampleBlock = Vec<f32, SAMPLE_COUNT>;
-
 pub type BiquadType = biquad::DirectForm2Transposed<f32>;
 pub type AudioFilter = audio_filter::Filter<BiquadType>;
