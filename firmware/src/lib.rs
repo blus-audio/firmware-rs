@@ -14,7 +14,8 @@ pub static SAI_ACTIVE_SIGNAL: Signal<ThreadModeRawMutex, bool> = Signal::new();
 
 pub const INPUT_CHANNEL_COUNT: usize = 2;
 pub const OUTPUT_CHANNEL_COUNT: usize = 4;
-pub const SAMPLE_RATE_HZ: u32 = 48000;
+pub const SAMPLE_RATE_HZ: u32 = 48_000;
+pub const FEEDBACK_COUNTER_TICK_RATE: u32 = 24_576_000;
 
 pub const SAMPLE_WIDTH: uac1::SampleWidth = uac1::SampleWidth::Width4Byte;
 pub const SAMPLE_SIZE: usize = SAMPLE_WIDTH as usize;
@@ -27,9 +28,11 @@ pub const AUDIO_SIZE_PER_MS: usize = (SAMPLE_RATE_HZ as usize / 1000) * INPUT_CH
 pub const USB_PACKET_SIZE: usize = 2 * AUDIO_SIZE_PER_MS;
 pub const SAMPLE_COUNT: usize = USB_PACKET_SIZE / SAMPLE_SIZE;
 
-// 1 ms for USB high-speed, 8 ms for USB full-speed.
-pub const FEEDBACK_REFRESH_PERIOD: uac1::FeedbackRefreshPeriod = uac1::FeedbackRefreshPeriod::Period8Frames;
+// 4 ms for USB high-speed, 32 ms for USB full-speed.
+pub const FEEDBACK_REFRESH_PERIOD: uac1::FeedbackRefresh = uac1::FeedbackRefresh::Period32Frames;
+
 pub static FEEDBACK_SIGNAL: Signal<CriticalSectionRawMutex, u32> = Signal::new();
+pub static VOLUME_SIGNAL: Signal<ThreadModeRawMutex, Vec<uac1::speaker::Volume, INPUT_CHANNEL_COUNT>> = Signal::new();
 
 pub type SampleBlock = Vec<f32, SAMPLE_COUNT>;
 

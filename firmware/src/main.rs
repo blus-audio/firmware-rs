@@ -2,21 +2,20 @@
 #![no_main]
 
 use core::cell::RefCell;
+use core::panic;
 
 use blus_fw::*;
 use defmt::{info, unwrap};
 use embassy_embedded_hal::shared_bus::blocking::i2c::I2cDevice;
 use embassy_executor::Spawner;
-use embassy_futures::join::join;
 use embassy_futures::select::{select, Either};
 use embassy_stm32::adc::{self, AdcChannel};
 use embassy_stm32::gpio::{Input, Level, Output, Pull, Speed};
 use embassy_stm32::mode::Async;
 use embassy_stm32::time::Hertz;
 use embassy_stm32::{bind_interrupts, i2c, interrupt, peripherals, timer, usb};
-use embassy_sync::blocking_mutex::raw::{CriticalSectionRawMutex, NoopRawMutex, ThreadModeRawMutex};
+use embassy_sync::blocking_mutex::raw::{CriticalSectionRawMutex, NoopRawMutex};
 use embassy_sync::blocking_mutex::{Mutex, NoopMutex};
-use embassy_sync::signal::Signal;
 use embassy_sync::zerocopy_channel;
 use embassy_time::{Duration, Ticker, Timer};
 use embassy_usb::class::uac1;
@@ -31,8 +30,6 @@ bind_interrupts!(struct Irqs {
     I2C1_EV => i2c::EventInterruptHandler<peripherals::I2C1>;
     I2C1_ER => i2c::ErrorInterruptHandler<peripherals::I2C1>;
 });
-
-static VOLUME_ADC_SIGNAL: Signal<ThreadModeRawMutex, (u8, u8)> = Signal::new();
 
 static TIMER: Mutex<CriticalSectionRawMutex, RefCell<Option<timer::low_level::Timer<peripherals::TIM2>>>> =
     Mutex::new(RefCell::new(None));
@@ -282,7 +279,7 @@ async fn amplifier_task(amplifier_resources: AmplifierResources) {
 
     loop {
         let play_fut = SAI_ACTIVE_SIGNAL.wait();
-        let volume_fut = VOLUME_ADC_SIGNAL.wait();
+        let volume_fut = VOLUME_SIGNAL.wait();
 
         match select(play_fut, volume_fut).await {
             Either::First(play) => {
@@ -294,82 +291,33 @@ async fn amplifier_task(amplifier_resources: AmplifierResources) {
                     // FIXME: Implement disable?
                 }
             }
-            Either::Second((volume_left, volume_right)) => {
-                for amplifier in [&mut tas2780_a, &mut tas2780_b] {
-                    amplifier.set_volume(volume_left);
+            Either::Second(volumes) => {
+                for volume in volumes {
+                    let (volume, channel) = match volume {
+                        speaker::Volume::Muted(channel) => (MUTE_VOLUME, channel),
+                        // Scale volume to an attenuation level from 0 (loudest) to 200 (quietest).
+                        speaker::Volume::DeciBel(channel, value) => {
+                            if value > 0.0 {
+                                panic!("Volume must not be positive.")
+                            }
+                            (-(2.0 * value) as u8, channel)
+                        }
+                    };
+
+                    match channel {
+                        uac1::Channel::LeftFront => {
+                            for amplifier in [&mut tas2780_a, &mut tas2780_b] {
+                                amplifier.set_volume(volume)
+                            }
+                        }
+                        uac1::Channel::RightFront => {
+                            for amplifier in [&mut tas2780_c, &mut tas2780_d] {
+                                amplifier.set_volume(volume)
+                            }
+                        }
+                        _ => (),
+                    };
                 }
-
-                for amplifier in [&mut tas2780_c, &mut tas2780_d] {
-                    amplifier.set_volume(volume_right);
-                }
-            }
-        }
-    }
-}
-
-#[embassy_executor::task]
-async fn volume_control_task(
-    mut adc_resources: AdcResources<peripherals::ADC1>,
-    control_changed: speaker::ControlChanged<'static>,
-    mut status_led: Output<'static>,
-) {
-    let adc1_measurement_buffer: &mut [u16] = unsafe {
-        ADC1_MEASUREMENT_BUFFER.initialize_all_copied(0);
-        let (ptr, len) = ADC1_MEASUREMENT_BUFFER.get_ptr_len();
-        core::slice::from_raw_parts_mut(ptr, len)
-    };
-
-    async fn measure(adc_resources: &mut AdcResources<peripherals::ADC1>, measurement_buffer: &mut [u16]) -> u8 {
-        adc_resources
-            .adc
-            .read(
-                &mut adc_resources.dma,
-                [(&mut adc_resources.pin, adc::SampleTime::CYCLES810_5)].into_iter(),
-                measurement_buffer,
-            )
-            .await;
-
-        let measured = (100f32 * (measurement_buffer[0] as f32) / 65535f32) as u8;
-
-        measured
-    }
-
-    // Converts an attenuation level in 8.8 binary signed fixpoint format to the TAS2780 representation.
-    // The TAS2780 understands volume levels from 0 (0 dB) to 0xC8 (-100 dB), where one step is 0.5 dB.
-    let attenuation_8q8_db_to_tas2780 = |x: i16| (-x >> 7) as u8;
-
-    // Define update rates
-    let mut control_changed_ticker = Ticker::every(Duration::from_hz(10));
-    let mut pot_ticker = Ticker::every(Duration::from_hz(1));
-
-    loop {
-        let control_changed_fut = join(control_changed.control_changed(), control_changed_ticker.next());
-        let pot_measured_fut = join(measure(&mut adc_resources, adc1_measurement_buffer), pot_ticker.next());
-
-        match select(pot_measured_fut, control_changed_fut).await {
-            Either::First((_measured, _)) => (),
-            Either::Second(_) => {
-                status_led.set_high();
-
-                let volume_left: u8;
-                if control_changed.is_muted(uac1::Channel::LeftFront).unwrap() {
-                    volume_left = tas2780::MUTE_VOLUME;
-                } else {
-                    volume_left =
-                        attenuation_8q8_db_to_tas2780(control_changed.volume_8q8_db(uac1::Channel::LeftFront).unwrap());
-                }
-
-                let volume_right: u8;
-                if control_changed.is_muted(uac1::Channel::RightFront).unwrap() {
-                    volume_right = tas2780::MUTE_VOLUME;
-                } else {
-                    volume_right = attenuation_8q8_db_to_tas2780(
-                        control_changed.volume_8q8_db(uac1::Channel::RightFront).unwrap(),
-                    );
-                }
-
-                VOLUME_ADC_SIGNAL.signal((volume_left, volume_right));
-                status_led.set_low();
             }
         }
     }
@@ -558,11 +506,32 @@ async fn main(spawner: Spawner) {
         pin_irqz: Input::new(p.PC14, Pull::None),
     };
 
-    let adc_resources = AdcResources {
+    let _adc_resources = AdcResources {
         adc: adc::Adc::new(p.ADC1),
         pin: p.PA6.degrade_adc(),
         dma: p.DMA1_CH0,
     };
+
+    let _adc1_measurement_buffer: &mut [u16] = unsafe {
+        ADC1_MEASUREMENT_BUFFER.initialize_all_copied(0);
+        let (ptr, len) = ADC1_MEASUREMENT_BUFFER.get_ptr_len();
+        core::slice::from_raw_parts_mut(ptr, len)
+    };
+
+    async fn _measure(adc_resources: &mut AdcResources<peripherals::ADC1>, measurement_buffer: &mut [u16]) -> u8 {
+        adc_resources
+            .adc
+            .read(
+                &mut adc_resources.dma,
+                [(&mut adc_resources.pin, adc::SampleTime::CYCLES810_5)].into_iter(),
+                measurement_buffer,
+            )
+            .await;
+
+        let measured = (100f32 * (measurement_buffer[0] as f32) / 65535f32) as u8;
+
+        measured
+    }
 
     // Establish a zero-copy channel for transferring received audio samples between tasks
     static SAMPLE_BLOCKS: StaticCell<[SampleBlock; 2]> = StaticCell::new();
@@ -574,7 +543,7 @@ async fn main(spawner: Spawner) {
 
     // Trigger on USB SOF (internal signal)
     let mut tim2 = timer::low_level::Timer::new(p.TIM2);
-    tim2.set_tick_freq(Hertz(24_576_000));
+    tim2.set_tick_freq(Hertz(FEEDBACK_COUNTER_TICK_RATE));
     tim2.set_trigger_source(timer::low_level::TriggerSource::ITR5);
     tim2.set_slave_mode(timer::low_level::SlaveMode::TRIGGER_MODE);
     tim2.regs_gp16().dier().modify(|r| r.set_tie(true));
@@ -586,7 +555,8 @@ async fn main(spawner: Spawner) {
         cortex_m::peripheral::NVIC::unmask(interrupt::TIM2);
     }
 
-    unwrap!(spawner.spawn(usb_audio::usb_audio_task(stream, feedback, sender, usb_device)));
+    unwrap!(spawner.spawn(usb_audio::control_task(control_changed, led_yellow)));
+    unwrap!(spawner.spawn(usb_audio::streaming_task(stream, feedback, sender, usb_device)));
     unwrap!(spawner.spawn(audio_routing::audio_routing_task(
         get_filters(),
         sai4_resources,
@@ -594,7 +564,6 @@ async fn main(spawner: Spawner) {
         led_blue
     )));
     unwrap!(spawner.spawn(heartbeat_task(led_red)));
-    unwrap!(spawner.spawn(volume_control_task(adc_resources, control_changed, led_yellow)));
     unwrap!(spawner.spawn(amplifier_task(amplifier_resources)));
 }
 
