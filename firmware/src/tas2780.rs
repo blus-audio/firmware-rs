@@ -256,7 +256,7 @@ where
         self.set_page(0x00);
 
         let mut tdm_cfg2: RegisterValue = 0x00;
-        tdm_cfg2 |= 0b10 << 0; // RX_SLEN: 32 bit
+        tdm_cfg2 |= 0b10; // RX_SLEN: 32 bit
         tdm_cfg2 |= 0b11 << 2; // RX_WLEN: 32 bit
 
         let mut tdm_cfg3: RegisterValue = 0x00;
@@ -272,7 +272,7 @@ where
             }
             Channel::StereoMix => {
                 tdm_cfg2 |= 0b11 << 4; // RX_SCFG: Stereo downmix (L+R)/2
-                tdm_cfg3 |= 0x01 << 4 | 0x00 << 0
+                tdm_cfg3 |= 0x01 << 4
             }
         }
 

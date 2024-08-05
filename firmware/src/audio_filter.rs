@@ -90,7 +90,7 @@ impl<B: Biquad<f32>> Filter<B> {
         for biquad in self.biquads.as_mut() {
             sample = biquad.run(sample);
         }
-        sample = sample * self.gain;
+        sample *= self.gain;
 
         self.delay.tick(sample)
     }

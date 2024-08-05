@@ -4,7 +4,6 @@
 use core::cell::RefCell;
 
 use blus_fw::*;
-
 use defmt::{info, unwrap};
 use embassy_embedded_hal::shared_bus::blocking::i2c::I2cDevice;
 use embassy_executor::Spawner;
@@ -12,11 +11,9 @@ use embassy_futures::join::join;
 use embassy_futures::select::{select, Either};
 use embassy_stm32::adc::{self, AdcChannel};
 use embassy_stm32::gpio::{Input, Level, Output, Pull, Speed};
-use embassy_stm32::interrupt;
 use embassy_stm32::mode::Async;
 use embassy_stm32::time::Hertz;
-use embassy_stm32::timer;
-use embassy_stm32::{bind_interrupts, i2c, peripherals, usb};
+use embassy_stm32::{bind_interrupts, i2c, interrupt, peripherals, timer, usb};
 use embassy_sync::blocking_mutex::raw::{CriticalSectionRawMutex, NoopRawMutex, ThreadModeRawMutex};
 use embassy_sync::blocking_mutex::{Mutex, NoopMutex};
 use embassy_sync::signal::Signal;
@@ -191,9 +188,9 @@ pub fn get_filters() -> (AudioFilter, AudioFilter, AudioFilter, AudioFilter) {
     ];
 
     // Negative gain inverts a channel.
-    let gain_a = -10.0f32.powf(-10.0 / 20.0);
+    let gain_a = -(10.0f32.powf(-10.0 / 20.0));
     let gain_b = 10.0f32.powf(-11.5 / 20.0);
-    let gain_c = -10.0f32.powf(-10.0 / 20.0);
+    let gain_c = -(10.0f32.powf(-10.0 / 20.0));
     let gain_d = 10.0f32.powf(-11.5 / 20.0);
 
     let delay_a: usize = 0;

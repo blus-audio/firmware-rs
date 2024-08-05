@@ -5,10 +5,8 @@ pub mod audio_routing;
 pub mod tas2780;
 pub mod usb_audio;
 
-use embassy_sync::{
-    blocking_mutex::raw::{CriticalSectionRawMutex, ThreadModeRawMutex},
-    signal::Signal,
-};
+use embassy_sync::blocking_mutex::raw::{CriticalSectionRawMutex, ThreadModeRawMutex};
+use embassy_sync::signal::Signal;
 use embassy_usb::class::uac1;
 use heapless::Vec;
 

@@ -1,5 +1,5 @@
-use crate::*;
 use core::cell::RefCell;
+
 use defmt::{info, panic};
 use embassy_futures::join::join3;
 use embassy_stm32::{peripherals, usb};
@@ -7,8 +7,9 @@ use embassy_sync::blocking_mutex::raw::NoopRawMutex;
 use embassy_sync::blocking_mutex::Mutex;
 use embassy_sync::zerocopy_channel;
 use embassy_usb::class::uac1::speaker;
-use embassy_usb::driver::EndpointError;
-use embassy_usb::driver::EnumeratedSpeed;
+use embassy_usb::driver::{EndpointError, EnumeratedSpeed};
+
+use crate::*;
 
 static ENUMERATED_SPEED: Mutex<ThreadModeRawMutex, RefCell<EnumeratedSpeed>> =
     Mutex::new(RefCell::new(EnumeratedSpeed::Unknown));

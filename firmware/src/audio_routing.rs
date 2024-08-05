@@ -1,11 +1,11 @@
-use crate::*;
 use defmt::{info, panic};
 use embassy_stm32::gpio::Output;
-use embassy_stm32::peripherals;
-use embassy_stm32::sai;
+use embassy_stm32::{peripherals, sai};
 use embassy_sync::blocking_mutex::raw::NoopRawMutex;
 use embassy_sync::zerocopy_channel;
 use grounded::uninit::GroundedArrayCell;
+
+use crate::*;
 
 // Factor of two for being able to buffer two full USB packets (excessive)
 const SAI4A_BUFFER_SIZE: usize = 2 * USB_PACKET_SIZE;
@@ -176,7 +176,7 @@ pub async fn audio_routing_task(
         // Notify the channel that the buffer is now ready to be reused
         receiver.receive_done();
 
-        if let Err(_) = result {
+        if result.is_err() {
             SAI_ACTIVE_SIGNAL.signal(false);
             info!("Renew SAI setup.");
 
