@@ -12,7 +12,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Format
-        run: cargo +nightly fmt
+        run: cargo fmt
       - name: Lint
         run: cargo clippy
       - name: Build
