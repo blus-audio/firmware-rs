@@ -4,6 +4,7 @@ on: push
 
 env:
   CARGO_TERM_COLOR: always
+  WORKING_DIRECTORY: ./firmware
 
 jobs:
   build:
@@ -12,10 +13,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Format
+        working-directory: $WORKING_DIRECTORY
         run: cargo fmt
       - name: Lint
+        working-directory: $WORKING_DIRECTORY
         run: cargo clippy
       - name: Build
+        working-directory: $WORKING_DIRECTORY
         run: cargo build --verbose
       - name: Test
+        working-directory: $WORKING_DIRECTORY
         run: cargo test --verbose
