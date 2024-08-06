@@ -8,20 +8,23 @@ use blus_fw::*;
 use defmt::{info, unwrap};
 use embassy_embedded_hal::shared_bus::blocking::i2c::I2cDevice;
 use embassy_executor::Spawner;
-use embassy_futures::select::{select, Either};
+use embassy_futures::select::{select3, Either3};
 use embassy_stm32::adc::{self, AdcChannel};
 use embassy_stm32::gpio::{Input, Level, Output, Pull, Speed};
 use embassy_stm32::mode::Async;
 use embassy_stm32::time::Hertz;
 use embassy_stm32::{bind_interrupts, i2c, interrupt, peripherals, timer, usb};
-use embassy_sync::blocking_mutex::raw::{CriticalSectionRawMutex, NoopRawMutex};
+use embassy_sync::blocking_mutex::raw::{CriticalSectionRawMutex, NoopRawMutex, ThreadModeRawMutex};
 use embassy_sync::blocking_mutex::{Mutex, NoopMutex};
+use embassy_sync::signal::Signal;
 use embassy_sync::zerocopy_channel;
 use embassy_time::{Duration, Ticker, Timer};
 use embassy_usb::class::uac1;
 use embassy_usb::class::uac1::speaker::{self, Speaker};
 use grounded::uninit::GroundedArrayCell;
 use heapless::Vec;
+use libm::{fabsf, roundf};
+use micromath::F32Ext;
 use static_cell::StaticCell;
 use {defmt_rtt as _, panic_probe as _};
 
@@ -31,6 +34,7 @@ bind_interrupts!(struct Irqs {
     I2C1_ER => i2c::ErrorInterruptHandler<peripherals::I2C1>;
 });
 
+static POT_GAIN_SIGNAL: Signal<ThreadModeRawMutex, f32> = Signal::new();
 static TIMER: Mutex<CriticalSectionRawMutex, RefCell<Option<timer::low_level::Timer<peripherals::TIM2>>>> =
     Mutex::new(RefCell::new(None));
 static I2C_BUS: StaticCell<NoopMutex<RefCell<i2c::I2c<'static, Async>>>> = StaticCell::new();
@@ -53,9 +57,12 @@ struct AdcResources<T: adc::Instance> {
     dma: peripherals::DMA1_CH0,
 }
 
+pub fn db_to_linear(db: f32) -> f32 {
+    10.0f32.powf(db / 20.0)
+}
+
 pub fn get_filters() -> (AudioFilter, AudioFilter, AudioFilter, AudioFilter) {
     use biquad::*;
-    use micromath::F32Ext;
 
     type B = BiquadType;
     type C = Coefficients<f32>;
@@ -185,10 +192,10 @@ pub fn get_filters() -> (AudioFilter, AudioFilter, AudioFilter, AudioFilter) {
     ];
 
     // Negative gain inverts a channel.
-    let gain_a = -(10.0f32.powf(-10.0 / 20.0));
-    let gain_b = 10.0f32.powf(-11.5 / 20.0);
-    let gain_c = -(10.0f32.powf(-10.0 / 20.0));
-    let gain_d = 10.0f32.powf(-11.5 / 20.0);
+    let gain_a = -db_to_linear(-10.0);
+    let gain_b = db_to_linear(-11.5);
+    let gain_c = -db_to_linear(-10.0);
+    let gain_d = db_to_linear(-11.5);
 
     let delay_a: usize = 0;
     let delay_b: usize = 6;
@@ -201,6 +208,60 @@ pub fn get_filters() -> (AudioFilter, AudioFilter, AudioFilter, AudioFilter) {
     let f_d = AudioFilter::new(gain_d, delay_d, biquads_d);
 
     (f_a, f_b, f_c, f_d)
+}
+
+#[embassy_executor::task]
+async fn volume_task(mut source_subscriber: SourceSubscriber) {
+    // Linear gains for different sources.
+    let mut pot_gain = 0.0_f32;
+    let mut usb_gain_left = 0.0_f32;
+    let mut usb_gain_right = 0.0_f32;
+    let mut audio_source = AudioSource::None;
+
+    loop {
+        let usb_volume_fut = USB_VOLUME_SIGNAL.wait();
+        let pot_gain_fut = POT_GAIN_SIGNAL.wait();
+        let source_fut = source_subscriber.next_message_pure();
+
+        match select3(usb_volume_fut, pot_gain_fut, source_fut).await {
+            Either3::First(volumes) => {
+                for volume in volumes {
+                    let (gain, channel) = match volume {
+                        speaker::Volume::Muted(channel) => (0.0, channel),
+                        speaker::Volume::DeciBel(channel, volume_db) => {
+                            if volume_db > 0.0 {
+                                panic!("Volume must not be positive.")
+                            }
+
+                            (db_to_linear(volume_db), channel)
+                        }
+                    };
+
+                    match channel {
+                        uac1::Channel::LeftFront => {
+                            usb_gain_left = gain;
+                        }
+                        uac1::Channel::RightFront => {
+                            usb_gain_right = gain;
+                        }
+                        _ => (),
+                    }
+                }
+            }
+            Either3::Second(gain) => {
+                pot_gain = gain;
+            }
+            Either3::Third(_audio_source) => audio_source = _audio_source,
+        };
+
+        let (gain_left, gain_right) = match audio_source {
+            AudioSource::Usb => (usb_gain_left, usb_gain_right),
+            AudioSource::Spdif => (pot_gain, pot_gain),
+            _ => (1.0, 1.0),
+        };
+
+        GAIN_SIGNAL.signal((gain_left, gain_right));
+    }
 }
 
 #[embassy_executor::task]
@@ -278,47 +339,14 @@ async fn amplifier_task(amplifier_resources: AmplifierResources) {
     }
 
     loop {
-        let play_fut = SAI_ACTIVE_SIGNAL.wait();
-        let volume_fut = VOLUME_SIGNAL.wait();
+        let play = SAI_ACTIVE_SIGNAL.wait().await;
 
-        match select(play_fut, volume_fut).await {
-            Either::First(play) => {
-                if play {
-                    for amplifier in [&mut tas2780_a, &mut tas2780_b, &mut tas2780_c, &mut tas2780_d] {
-                        amplifier.enable();
-                    }
-                } else {
-                    // FIXME: Implement disable?
-                }
+        if play {
+            for amplifier in [&mut tas2780_a, &mut tas2780_b, &mut tas2780_c, &mut tas2780_d] {
+                amplifier.enable();
             }
-            Either::Second(volumes) => {
-                for volume in volumes {
-                    let (volume, channel) = match volume {
-                        speaker::Volume::Muted(channel) => (MUTE_VOLUME, channel),
-                        // Scale volume to an attenuation level from 0 (loudest) to 200 (quietest).
-                        speaker::Volume::DeciBel(channel, value) => {
-                            if value > 0.0 {
-                                panic!("Volume must not be positive.")
-                            }
-                            (-(2.0 * value) as u8, channel)
-                        }
-                    };
-
-                    match channel {
-                        uac1::Channel::LeftFront => {
-                            for amplifier in [&mut tas2780_a, &mut tas2780_b] {
-                                amplifier.set_volume(volume)
-                            }
-                        }
-                        uac1::Channel::RightFront => {
-                            for amplifier in [&mut tas2780_c, &mut tas2780_d] {
-                                amplifier.set_volume(volume)
-                            }
-                        }
-                        _ => (),
-                    };
-                }
-            }
+        } else {
+            // FIXME: Implement disable?
         }
     }
 }
@@ -330,6 +358,46 @@ async fn heartbeat_task(mut status_led: Output<'static>) {
     loop {
         ticker.next().await;
         status_led.toggle();
+    }
+}
+
+#[embassy_executor::task]
+async fn potentiometer_task(mut adc_resources: AdcResources<peripherals::ADC1>) {
+    let mut ticker = Ticker::every(Duration::from_hz(10));
+
+    let buffer: &mut [u16] = unsafe {
+        ADC1_MEASUREMENT_BUFFER.initialize_all_copied(0);
+        let (ptr, len) = ADC1_MEASUREMENT_BUFFER.get_ptr_len();
+        core::slice::from_raw_parts_mut(ptr, len)
+    };
+
+    let mut gain = 0.0;
+
+    loop {
+        ticker.next().await;
+
+        adc_resources
+            .adc
+            .read(
+                &mut adc_resources.dma,
+                [(&mut adc_resources.pin, adc::SampleTime::CYCLES810_5)].into_iter(),
+                buffer,
+            )
+            .await;
+
+        // Ranges from 0.0 to 1.0.
+        let measured = (buffer[0] as f32) / 65535f32;
+
+        // Round to steps of 0.05.
+        let rounded = roundf(20.0 * measured) / 20.0;
+
+        if fabsf(gain - measured) >= 0.04 {
+            gain = rounded;
+
+            // Make gain exponential
+            let exp_gain = gain.powf(2.0);
+            POT_GAIN_SIGNAL.signal(exp_gain);
+        }
     }
 }
 
@@ -506,32 +574,11 @@ async fn main(spawner: Spawner) {
         pin_irqz: Input::new(p.PC14, Pull::None),
     };
 
-    let _adc_resources = AdcResources {
+    let adc_resources = AdcResources {
         adc: adc::Adc::new(p.ADC1),
         pin: p.PA6.degrade_adc(),
         dma: p.DMA1_CH0,
     };
-
-    let _adc1_measurement_buffer: &mut [u16] = unsafe {
-        ADC1_MEASUREMENT_BUFFER.initialize_all_copied(0);
-        let (ptr, len) = ADC1_MEASUREMENT_BUFFER.get_ptr_len();
-        core::slice::from_raw_parts_mut(ptr, len)
-    };
-
-    async fn _measure(adc_resources: &mut AdcResources<peripherals::ADC1>, measurement_buffer: &mut [u16]) -> u8 {
-        adc_resources
-            .adc
-            .read(
-                &mut adc_resources.dma,
-                [(&mut adc_resources.pin, adc::SampleTime::CYCLES810_5)].into_iter(),
-                measurement_buffer,
-            )
-            .await;
-
-        let measured = (100f32 * (measurement_buffer[0] as f32) / 65535f32) as u8;
-
-        measured
-    }
 
     // Establish a zero-copy channel for transferring received audio samples between tasks
     static SAMPLE_BLOCKS: StaticCell<[SampleBlock; 2]> = StaticCell::new();
@@ -555,16 +602,26 @@ async fn main(spawner: Spawner) {
         cortex_m::peripheral::NVIC::unmask(interrupt::TIM2);
     }
 
+    let source_subscriber_0 = SOURCE_CHANNEL.subscriber().unwrap();
+    let source_subscriber_1 = SOURCE_CHANNEL.subscriber().unwrap();
+    let source_publisher = SOURCE_CHANNEL.publisher().unwrap();
+
+    // FIXME: decide, based on input levels.
+    source_publisher.publish_immediate(AudioSource::Usb);
+
     unwrap!(spawner.spawn(usb_audio::control_task(control_changed, led_yellow)));
     unwrap!(spawner.spawn(usb_audio::streaming_task(stream, feedback, sender, usb_device)));
     unwrap!(spawner.spawn(audio_routing::audio_routing_task(
         get_filters(),
         sai4_resources,
         receiver,
+        source_subscriber_0,
         led_blue
     )));
-    unwrap!(spawner.spawn(heartbeat_task(led_red)));
+    unwrap!(spawner.spawn(volume_task(source_subscriber_1)));
+    unwrap!(spawner.spawn(potentiometer_task(adc_resources)));
     unwrap!(spawner.spawn(amplifier_task(amplifier_resources)));
+    unwrap!(spawner.spawn(heartbeat_task(led_red)));
 }
 
 #[interrupt]

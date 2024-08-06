@@ -309,7 +309,7 @@ where
 
         self.enable();
 
-        // Set mute volume (-100 dB)
-        self.set_volume(200);
+        // Set maximum volume (0 dB)
+        self.set_volume(0);
     }
 }

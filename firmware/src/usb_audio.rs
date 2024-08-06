@@ -156,8 +156,6 @@ pub async fn streaming_task(
 
 #[embassy_executor::task]
 pub async fn control_task(control_monitor: speaker::ControlMonitor<'static>, mut status_led: Output<'static>) {
-    let mut control_changed_ticker = embassy_time::Ticker::every(embassy_time::Duration::from_hz(10));
-
     loop {
         control_monitor.changed().await;
 
@@ -170,9 +168,8 @@ pub async fn control_task(control_monitor: speaker::ControlMonitor<'static>, mut
         volumes
             .push(control_monitor.volume(uac1::Channel::RightFront).unwrap())
             .unwrap();
-        VOLUME_SIGNAL.signal(volumes);
+        USB_VOLUME_SIGNAL.signal(volumes);
 
         status_led.set_low();
-        control_changed_ticker.next().await;
     }
 }

@@ -6,9 +6,20 @@ pub mod tas2780;
 pub mod usb_audio;
 
 use embassy_sync::blocking_mutex::raw::{CriticalSectionRawMutex, ThreadModeRawMutex};
+use embassy_sync::pubsub::{PubSubChannel, Subscriber};
 use embassy_sync::signal::Signal;
 use embassy_usb::class::uac1;
 use heapless::Vec;
+
+#[derive(Clone, Copy, Debug)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub enum AudioSource {
+    None,
+    Usb,
+    Spdif,
+    Ext,
+    RaspberryPi,
+}
 
 // Stereo input -> two two-way speakers
 pub const INPUT_CHANNEL_COUNT: usize = 2;
@@ -31,10 +42,15 @@ pub const SAMPLE_COUNT: usize = USB_PACKET_SIZE / SAMPLE_SIZE;
 // 4 ms for USB high-speed, 32 ms for USB full-speed.
 pub const FEEDBACK_REFRESH_PERIOD: uac1::FeedbackRefresh = uac1::FeedbackRefresh::Period32Frames;
 
-// Signals for task communication
+// Signals and channels for task communication
 pub static SAI_ACTIVE_SIGNAL: Signal<ThreadModeRawMutex, bool> = Signal::new();
 pub static FEEDBACK_SIGNAL: Signal<CriticalSectionRawMutex, u32> = Signal::new();
-pub static VOLUME_SIGNAL: Signal<ThreadModeRawMutex, Vec<uac1::speaker::Volume, INPUT_CHANNEL_COUNT>> = Signal::new();
+pub static USB_VOLUME_SIGNAL: Signal<ThreadModeRawMutex, Vec<uac1::speaker::Volume, INPUT_CHANNEL_COUNT>> =
+    Signal::new();
+pub static GAIN_SIGNAL: Signal<ThreadModeRawMutex, (f32, f32)> = Signal::new();
+
+pub static SOURCE_CHANNEL: PubSubChannel<ThreadModeRawMutex, AudioSource, 1, 2, 1> = PubSubChannel::new();
+pub type SourceSubscriber = Subscriber<'static, ThreadModeRawMutex, AudioSource, 1, 2, 1>;
 
 // Type definitions
 pub type SampleBlock = Vec<f32, SAMPLE_COUNT>;

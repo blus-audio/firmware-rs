@@ -13,7 +13,7 @@ fn clip_q63_to_q31(sample: i64) -> i32 {
     }
 }
 
-/// Convert a float sample to its 1q31 representation. Clips inputs outside of [-1, 1).
+/// Convert a float sample to its 1q31 representation. Clips to [-1, 1).
 pub fn sample_to_u32(sample: f32) -> u32 {
     clip_q63_to_q31((sample * Q31_SCALING_FACTOR) as i64) as u32
 }

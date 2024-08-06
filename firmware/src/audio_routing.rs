@@ -1,4 +1,5 @@
 use defmt::{info, panic};
+use embassy_futures::select::{select3, Either3};
 use embassy_stm32::gpio::Output;
 use embassy_stm32::{peripherals, sai};
 use embassy_sync::blocking_mutex::raw::NoopRawMutex;
@@ -118,6 +119,7 @@ pub async fn audio_routing_task(
     filters: (AudioFilter, AudioFilter, AudioFilter, AudioFilter),
     mut sai4_resources: Sai4Resources,
     mut receiver: zerocopy_channel::Receiver<'static, NoopRawMutex, SampleBlock>,
+    mut source_subscriber: SourceSubscriber,
     mut status_led: Output<'static>,
 ) {
     let sai4_a_write_buffer: &mut [u32] = unsafe {
@@ -142,55 +144,69 @@ pub async fn audio_routing_task(
     // _sai4_b_driver.start();
 
     let (mut filter_a, mut filter_b, mut filter_c, mut filter_d) = filters;
+    let mut gain_left = 0.0;
+    let mut gain_right = 0.0;
 
     loop {
-        let samples = receiver.receive().await;
-        let mut samples_u32: Vec<u32, { 2 * SAMPLE_COUNT }> = Vec::new();
+        let samples_fut = receiver.receive();
+        let gain_fut = GAIN_SIGNAL.wait();
+        let audio_source_fut = source_subscriber.next_message_pure();
 
-        status_led.set_high();
+        match select3(samples_fut, gain_fut, audio_source_fut).await {
+            Either3::First(samples) => {
+                let mut samples_u32: Vec<u32, { 2 * SAMPLE_COUNT }> = Vec::new();
 
-        for (index, sample) in samples.iter().enumerate() {
-            if index % 2 == 0 {
-                // Left channel
-                samples_u32
-                    .push(audio_filter::sample_to_u32(filter_a.run(*sample)))
-                    .unwrap();
-                samples_u32
-                    .push(audio_filter::sample_to_u32(filter_b.run(*sample)))
-                    .unwrap();
-            } else {
-                // Right channel
-                samples_u32
-                    .push(audio_filter::sample_to_u32(filter_c.run(*sample)))
-                    .unwrap();
-                samples_u32
-                    .push(audio_filter::sample_to_u32(filter_d.run(*sample)))
-                    .unwrap();
+                status_led.set_high();
+
+                for (index, sample) in samples.iter().enumerate() {
+                    if index % 2 == 0 {
+                        // Left channel
+                        samples_u32
+                            .push(audio_filter::sample_to_u32(filter_a.run(*sample) * gain_left))
+                            .unwrap();
+                        samples_u32
+                            .push(audio_filter::sample_to_u32(filter_b.run(*sample) * gain_left))
+                            .unwrap();
+                    } else {
+                        // Right channel
+                        samples_u32
+                            .push(audio_filter::sample_to_u32(filter_c.run(*sample) * gain_right))
+                            .unwrap();
+                        samples_u32
+                            .push(audio_filter::sample_to_u32(filter_d.run(*sample) * gain_right))
+                            .unwrap();
+                    }
+                }
+
+                status_led.set_low();
+
+                let result = sai4_a_driver.write(&samples_u32).await;
+
+                // Notify the channel that the buffer is now ready to be reused
+                receiver.receive_done();
+
+                if result.is_err() {
+                    SAI_ACTIVE_SIGNAL.signal(false);
+                    info!("Renew SAI setup.");
+
+                    drop(sai4_a_driver);
+                    drop(_sai4_b_driver);
+                    (sai4_a_driver, _sai4_b_driver) = new_sai4(
+                        &mut sai4_resources,
+                        sai4_a_write_buffer,
+                        sai4_b_read_buffer,
+                        SAMPLE_RATE_HZ,
+                    );
+                    sai4_a_driver.start();
+
+                    SAI_ACTIVE_SIGNAL.signal(true);
+                }
             }
-        }
-
-        status_led.set_low();
-
-        let result = sai4_a_driver.write(&samples_u32).await;
-
-        // Notify the channel that the buffer is now ready to be reused
-        receiver.receive_done();
-
-        if result.is_err() {
-            SAI_ACTIVE_SIGNAL.signal(false);
-            info!("Renew SAI setup.");
-
-            drop(sai4_a_driver);
-            drop(_sai4_b_driver);
-            (sai4_a_driver, _sai4_b_driver) = new_sai4(
-                &mut sai4_resources,
-                sai4_a_write_buffer,
-                sai4_b_read_buffer,
-                SAMPLE_RATE_HZ,
-            );
-            sai4_a_driver.start();
-
-            SAI_ACTIVE_SIGNAL.signal(true);
+            Either3::Second((_gain_left, _gain_right)) => {
+                gain_left = _gain_left;
+                gain_right = _gain_right;
+            }
+            Either3::Third(_audio_source) => (),
         }
     }
 }
