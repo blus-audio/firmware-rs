@@ -1,4 +1,5 @@
 use biquad::*;
+use heapless::Vec;
 
 const MAX_DELAY_LENGTH: usize = 32;
 const MAX_BIQUAD_COUNT: usize = 10;
@@ -63,10 +64,15 @@ impl Delay {
     }
 }
 
+/// A chain of biquad filters with gain and delay.
 pub struct Filter<B: Biquad<f32>> {
+    /// The linear gain.
     gain: f32,
+    /// A delay in number of samples.
     delay: Delay,
-    biquads: [B; MAX_BIQUAD_COUNT],
+    /// The chain of biquad filters.
+    /// FIXME: A vector is slower than an array, why is that?
+    biquads: Vec<B, MAX_BIQUAD_COUNT>,
 }
 
 impl<B: Biquad<f32>> Filter<B> {
@@ -77,7 +83,7 @@ impl<B: Biquad<f32>> Filter<B> {
     /// * `gain` - A linear gain for the filter.
     /// * `delay_length` - A delay to apply, in number of samples.
     /// * `biquads` - The biquads to apply when running the filter.
-    pub fn new(gain: f32, delay_length: usize, biquads: [B; MAX_BIQUAD_COUNT]) -> Self {
+    pub fn new(gain: f32, delay_length: usize, biquads: Vec<B, MAX_BIQUAD_COUNT>) -> Self {
         Filter {
             gain,
             delay: Delay::new(delay_length),
@@ -87,8 +93,8 @@ impl<B: Biquad<f32>> Filter<B> {
 
     /// Run the filter on a provided sample.
     pub fn run(&mut self, mut sample: f32) -> f32 {
-        for biquad in self.biquads.as_mut() {
-            sample = biquad.run(sample);
+        for b in &mut self.biquads {
+            sample = b.run(sample);
         }
         sample *= self.gain;
 

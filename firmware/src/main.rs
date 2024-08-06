@@ -70,7 +70,7 @@ pub fn get_filters() -> (AudioFilter, AudioFilter, AudioFilter, AudioFilter) {
     let f_co = 1800.hz();
     let fs = SAMPLE_RATE_HZ.hz();
 
-    let biquads_a = [
+    let biquads_a = Vec::from_slice(&[
         B::new(C::from_params(Type::AllPass, fs, f_co, 0.6).unwrap()),
         B::new(C {
             a1: -1.9925941047116,
@@ -86,15 +86,9 @@ pub fn get_filters() -> (AudioFilter, AudioFilter, AudioFilter, AudioFilter) {
         B::new(C::from_params(Type::PeakingEQ(-3.0), fs, 3450.hz(), 2.0).unwrap()),
         B::new(C::from_params(Type::LowPass, fs, f_co, Q_BUTTERWORTH_F32).unwrap()),
         B::new(C::from_params(Type::LowPass, fs, f_co, Q_BUTTERWORTH_F32).unwrap()),
-        B::new(C {
-            a1: 0.0,
-            a2: 0.0,
-            b0: 1.0,
-            b1: 0.0,
-            b2: 0.0,
-        }),
-    ];
-    let biquads_c = [
+    ])
+    .unwrap();
+    let biquads_c = Vec::from_slice(&[
         B::new(C::from_params(Type::AllPass, fs, f_co, 0.6).unwrap()),
         B::new(C {
             a1: -1.9925941047116,
@@ -110,86 +104,26 @@ pub fn get_filters() -> (AudioFilter, AudioFilter, AudioFilter, AudioFilter) {
         B::new(C::from_params(Type::PeakingEQ(-3.0), fs, 3450.hz(), 2.0).unwrap()),
         B::new(C::from_params(Type::LowPass, fs, f_co, Q_BUTTERWORTH_F32).unwrap()),
         B::new(C::from_params(Type::LowPass, fs, f_co, Q_BUTTERWORTH_F32).unwrap()),
-        B::new(C {
-            a1: 0.0,
-            a2: 0.0,
-            b0: 1.0,
-            b1: 0.0,
-            b2: 0.0,
-        }),
-    ];
-    let biquads_b = [
+    ])
+    .unwrap();
+    let biquads_b = Vec::from_slice(&[
         B::new(C::from_params(Type::PeakingEQ(-9.0), fs, 1700.hz(), 0.3).unwrap()),
         B::new(C::from_params(Type::PeakingEQ(1.0), fs, 7700.hz(), 2.0).unwrap()),
         B::new(C::from_params(Type::PeakingEQ(-1.0), fs, 12000.hz(), 2.0).unwrap()),
         B::new(C::from_params(Type::PeakingEQ(6.0), fs, 18000.hz(), 0.6).unwrap()),
         B::new(C::from_params(Type::HighPass, fs, f_co, Q_BUTTERWORTH_F32).unwrap()),
         B::new(C::from_params(Type::HighPass, fs, f_co, Q_BUTTERWORTH_F32).unwrap()),
-        B::new(C {
-            a1: 0.0,
-            a2: 0.0,
-            b0: 1.0,
-            b1: 0.0,
-            b2: 0.0,
-        }),
-        B::new(C {
-            a1: 0.0,
-            a2: 0.0,
-            b0: 1.0,
-            b1: 0.0,
-            b2: 0.0,
-        }),
-        B::new(C {
-            a1: 0.0,
-            a2: 0.0,
-            b0: 1.0,
-            b1: 0.0,
-            b2: 0.0,
-        }),
-        B::new(C {
-            a1: 0.0,
-            a2: 0.0,
-            b0: 1.0,
-            b1: 0.0,
-            b2: 0.0,
-        }),
-    ];
-    let biquads_d = [
+    ])
+    .unwrap();
+    let biquads_d = Vec::from_slice(&[
         B::new(C::from_params(Type::PeakingEQ(-9.0), fs, 1700.hz(), 0.3).unwrap()),
         B::new(C::from_params(Type::PeakingEQ(1.0), fs, 7700.hz(), 2.0).unwrap()),
         B::new(C::from_params(Type::PeakingEQ(-1.0), fs, 12000.hz(), 2.0).unwrap()),
         B::new(C::from_params(Type::PeakingEQ(6.0), fs, 18000.hz(), 0.6).unwrap()),
         B::new(C::from_params(Type::HighPass, fs, f_co, Q_BUTTERWORTH_F32).unwrap()),
         B::new(C::from_params(Type::HighPass, fs, f_co, Q_BUTTERWORTH_F32).unwrap()),
-        B::new(C {
-            a1: 0.0,
-            a2: 0.0,
-            b0: 1.0,
-            b1: 0.0,
-            b2: 0.0,
-        }),
-        B::new(C {
-            a1: 0.0,
-            a2: 0.0,
-            b0: 1.0,
-            b1: 0.0,
-            b2: 0.0,
-        }),
-        B::new(C {
-            a1: 0.0,
-            a2: 0.0,
-            b0: 1.0,
-            b1: 0.0,
-            b2: 0.0,
-        }),
-        B::new(C {
-            a1: 0.0,
-            a2: 0.0,
-            b0: 1.0,
-            b1: 0.0,
-            b2: 0.0,
-        }),
-    ];
+    ])
+    .unwrap();
 
     // Negative gain inverts a channel.
     let gain_a = -db_to_linear(-10.0);
