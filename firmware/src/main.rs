@@ -61,16 +61,23 @@ pub fn db_to_linear(db: f32) -> f32 {
     10.0f32.powf(db / 20.0)
 }
 
-pub fn get_filters() -> (AudioFilter, AudioFilter, AudioFilter, AudioFilter) {
+pub fn get_filters() -> [AudioFilter<'static>; OUTPUT_CHANNEL_COUNT] {
     use biquad::*;
 
     type B = BiquadType;
     type C = Coefficients<f32>;
 
+    // Crossover frequency
     let f_co = 1800.hz();
+
     let fs = SAMPLE_RATE_HZ.hz();
 
-    let biquads_a = Vec::from_slice(&[
+    static BIQUADS_A: StaticCell<[B; 9]> = StaticCell::new();
+    static BIQUADS_C: StaticCell<[B; 9]> = StaticCell::new();
+    static BIQUADS_B: StaticCell<[B; 6]> = StaticCell::new();
+    static BIQUADS_D: StaticCell<[B; 6]> = StaticCell::new();
+
+    let biquads_a = BIQUADS_A.init([
         B::new(C::from_params(Type::AllPass, fs, f_co, 0.6).unwrap()),
         B::new(C {
             a1: -1.9925941047116,
@@ -86,9 +93,9 @@ pub fn get_filters() -> (AudioFilter, AudioFilter, AudioFilter, AudioFilter) {
         B::new(C::from_params(Type::PeakingEQ(-3.0), fs, 3450.hz(), 2.0).unwrap()),
         B::new(C::from_params(Type::LowPass, fs, f_co, Q_BUTTERWORTH_F32).unwrap()),
         B::new(C::from_params(Type::LowPass, fs, f_co, Q_BUTTERWORTH_F32).unwrap()),
-    ])
-    .unwrap();
-    let biquads_c = Vec::from_slice(&[
+    ]);
+
+    let biquads_c = BIQUADS_C.init([
         B::new(C::from_params(Type::AllPass, fs, f_co, 0.6).unwrap()),
         B::new(C {
             a1: -1.9925941047116,
@@ -104,26 +111,25 @@ pub fn get_filters() -> (AudioFilter, AudioFilter, AudioFilter, AudioFilter) {
         B::new(C::from_params(Type::PeakingEQ(-3.0), fs, 3450.hz(), 2.0).unwrap()),
         B::new(C::from_params(Type::LowPass, fs, f_co, Q_BUTTERWORTH_F32).unwrap()),
         B::new(C::from_params(Type::LowPass, fs, f_co, Q_BUTTERWORTH_F32).unwrap()),
-    ])
-    .unwrap();
-    let biquads_b = Vec::from_slice(&[
+    ]);
+
+    let biquads_b = BIQUADS_B.init([
         B::new(C::from_params(Type::PeakingEQ(-9.0), fs, 1700.hz(), 0.3).unwrap()),
         B::new(C::from_params(Type::PeakingEQ(1.0), fs, 7700.hz(), 2.0).unwrap()),
         B::new(C::from_params(Type::PeakingEQ(-1.0), fs, 12000.hz(), 2.0).unwrap()),
         B::new(C::from_params(Type::PeakingEQ(6.0), fs, 18000.hz(), 0.6).unwrap()),
         B::new(C::from_params(Type::HighPass, fs, f_co, Q_BUTTERWORTH_F32).unwrap()),
         B::new(C::from_params(Type::HighPass, fs, f_co, Q_BUTTERWORTH_F32).unwrap()),
-    ])
-    .unwrap();
-    let biquads_d = Vec::from_slice(&[
+    ]);
+
+    let biquads_d = BIQUADS_D.init([
         B::new(C::from_params(Type::PeakingEQ(-9.0), fs, 1700.hz(), 0.3).unwrap()),
         B::new(C::from_params(Type::PeakingEQ(1.0), fs, 7700.hz(), 2.0).unwrap()),
         B::new(C::from_params(Type::PeakingEQ(-1.0), fs, 12000.hz(), 2.0).unwrap()),
         B::new(C::from_params(Type::PeakingEQ(6.0), fs, 18000.hz(), 0.6).unwrap()),
         B::new(C::from_params(Type::HighPass, fs, f_co, Q_BUTTERWORTH_F32).unwrap()),
         B::new(C::from_params(Type::HighPass, fs, f_co, Q_BUTTERWORTH_F32).unwrap()),
-    ])
-    .unwrap();
+    ]);
 
     // Negative gain inverts a channel.
     let gain_a = -db_to_linear(-10.0);
@@ -141,7 +147,7 @@ pub fn get_filters() -> (AudioFilter, AudioFilter, AudioFilter, AudioFilter) {
     let f_c = AudioFilter::new(gain_c, delay_c, biquads_c);
     let f_d = AudioFilter::new(gain_d, delay_d, biquads_d);
 
-    (f_a, f_b, f_c, f_d)
+    [f_a, f_b, f_c, f_d]
 }
 
 #[embassy_executor::task]

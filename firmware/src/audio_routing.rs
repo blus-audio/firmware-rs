@@ -116,7 +116,7 @@ fn new_sai4<'d>(
 
 #[embassy_executor::task]
 pub async fn audio_routing_task(
-    filters: (AudioFilter, AudioFilter, AudioFilter, AudioFilter),
+    filters: [AudioFilter<'static>; OUTPUT_CHANNEL_COUNT],
     mut sai4_resources: Sai4Resources,
     mut receiver: zerocopy_channel::Receiver<'static, NoopRawMutex, SampleBlock>,
     mut source_subscriber: SourceSubscriber,
@@ -143,7 +143,7 @@ pub async fn audio_routing_task(
     sai4_a_driver.start();
     // _sai4_b_driver.start();
 
-    let (mut filter_a, mut filter_b, mut filter_c, mut filter_d) = filters;
+    let [mut filter_a, mut filter_b, mut filter_c, mut filter_d] = filters;
     let mut gain_left = 0.0;
     let mut gain_right = 0.0;
 

@@ -55,4 +55,4 @@ pub type SourceSubscriber = Subscriber<'static, ThreadModeRawMutex, AudioSource,
 // Type definitions
 pub type SampleBlock = Vec<f32, SAMPLE_COUNT>;
 pub type BiquadType = biquad::DirectForm2Transposed<f32>;
-pub type AudioFilter = audio_filter::Filter<BiquadType>;
+pub type AudioFilter<'d> = audio_filter::Filter<'d, BiquadType>;
