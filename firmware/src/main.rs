@@ -5,7 +5,7 @@ use core::cell::RefCell;
 use core::panic;
 
 use blus_fw::*;
-use defmt::{info, unwrap};
+use defmt::{debug, info, unwrap};
 use embassy_embedded_hal::shared_bus::blocking::i2c::I2cDevice;
 use embassy_executor::Spawner;
 use embassy_futures::select::{select3, Either3};
@@ -166,14 +166,14 @@ async fn volume_task(mut source_subscriber: SourceSubscriber) {
         match select3(usb_volume_fut, pot_gain_fut, source_fut).await {
             Either3::First(volumes) => {
                 for volume in volumes {
-                    let (gain, channel) = match volume {
-                        speaker::Volume::Muted(channel) => (0.0, channel),
+                    let (channel, gain) = match volume {
+                        speaker::Volume::Muted(channel) => (channel, 0.0),
                         speaker::Volume::DeciBel(channel, volume_db) => {
                             if volume_db > 0.0 {
                                 panic!("Volume must not be positive.")
                             }
 
-                            (db_to_linear(volume_db), channel)
+                            (channel, db_to_linear(volume_db))
                         }
                     };
 
@@ -197,7 +197,8 @@ async fn volume_task(mut source_subscriber: SourceSubscriber) {
         let (gain_left, gain_right) = match audio_source {
             AudioSource::Usb => (usb_gain_left, usb_gain_right),
             AudioSource::Spdif => (pot_gain, pot_gain),
-            _ => (1.0, 1.0),
+            AudioSource::RaspberryPi => (pot_gain, pot_gain),
+            _ => (0.0, 0.0),
         };
 
         GAIN_SIGNAL.signal((gain_left, gain_right));
@@ -265,7 +266,7 @@ async fn amplifier_task(amplifier_resources: AmplifierResources) {
         NOISE_GATE,
     );
 
-    info!("Reset amplifiers.");
+    debug!("Reset amplifiers.");
     pin_nsd.set_low();
     Timer::after_millis(10).await;
     pin_nsd.set_high();
@@ -273,7 +274,7 @@ async fn amplifier_task(amplifier_resources: AmplifierResources) {
     // Wait for reset
     Timer::after_millis(10).await;
 
-    info!("Initialize TAS2780");
+    debug!("Initialize TAS2780");
     for amplifier in [&mut tas2780_a, &mut tas2780_b, &mut tas2780_c, &mut tas2780_d] {
         amplifier.init().await;
     }
@@ -293,11 +294,13 @@ async fn amplifier_task(amplifier_resources: AmplifierResources) {
 
 #[embassy_executor::task]
 async fn heartbeat_task(mut status_led: Output<'static>) {
-    let mut ticker = Ticker::every(Duration::from_hz(1));
+    let mut ticker = Ticker::every(Duration::from_secs(3));
 
     loop {
         ticker.next().await;
-        status_led.toggle();
+        status_led.set_high();
+        Timer::after_millis(50).await;
+        status_led.set_low();
     }
 }
 
@@ -400,20 +403,21 @@ async fn main(spawner: Spawner) {
         led.set_low();
     }
 
-    info!("USB packet size is {} byte", USB_PACKET_SIZE);
-    static CONFIG_DESCRIPTOR: StaticCell<[u8; 128]> = StaticCell::new();
-    let config_descriptor = CONFIG_DESCRIPTOR.init([0; 128]);
+    debug!("USB packet size is {} byte", USB_MAX_PACKET_SIZE);
+    static CONFIG_DESCRIPTOR: StaticCell<[u8; 256]> = StaticCell::new();
+    let config_descriptor = CONFIG_DESCRIPTOR.init([0; 256]);
 
-    static BOS_DESCRIPTOR: StaticCell<[u8; 16]> = StaticCell::new();
-    let bos_descriptor = BOS_DESCRIPTOR.init([0; 16]);
+    static BOS_DESCRIPTOR: StaticCell<[u8; 32]> = StaticCell::new();
+    let bos_descriptor = BOS_DESCRIPTOR.init([0; 32]);
 
     const CONTROL_BUF_SIZE: usize = 64;
     static CONTROL_BUF: StaticCell<[u8; CONTROL_BUF_SIZE]> = StaticCell::new();
     let control_buf = CONTROL_BUF.init([0; CONTROL_BUF_SIZE]);
 
     const FEEDBACK_BUF_SIZE: usize = 4;
-    static EP_OUT_BUFFER: StaticCell<[u8; FEEDBACK_BUF_SIZE + CONTROL_BUF_SIZE + USB_PACKET_SIZE]> = StaticCell::new();
-    let ep_out_buffer = EP_OUT_BUFFER.init([0u8; FEEDBACK_BUF_SIZE + CONTROL_BUF_SIZE + USB_PACKET_SIZE]);
+    static EP_OUT_BUFFER: StaticCell<[u8; FEEDBACK_BUF_SIZE + CONTROL_BUF_SIZE + USB_MAX_PACKET_SIZE]> =
+        StaticCell::new();
+    let ep_out_buffer = EP_OUT_BUFFER.init([0u8; FEEDBACK_BUF_SIZE + CONTROL_BUF_SIZE + USB_MAX_PACKET_SIZE]);
 
     static STATE: StaticCell<speaker::State> = StaticCell::new();
     let state = STATE.init(speaker::State::new());
@@ -428,7 +432,28 @@ async fn main(spawner: Spawner) {
     usb_config.xcvrdly = true;
 
     // Initialize driver for high-speed external PHY.
+    #[cfg(feature = "usb_high_speed")]
     let usb_driver = usb::Driver::new_hs_ulpi(
+        p.USB_OTG_HS,
+        Irqs,
+        p.PA5,
+        p.PC2,
+        p.PC3,
+        p.PC0,
+        p.PA3,
+        p.PB0,
+        p.PB1,
+        p.PB10,
+        p.PB11,
+        p.PB12,
+        p.PB13,
+        p.PB5,
+        ep_out_buffer,
+        usb_config,
+    );
+
+    #[cfg(not(feature = "usb_high_speed"))]
+    let usb_driver = usb::Driver::new_fs_ulpi(
         p.USB_OTG_HS,
         Irqs,
         p.PA5,
@@ -474,7 +499,7 @@ async fn main(spawner: Spawner) {
     let (stream, feedback, control_changed) = Speaker::new(
         &mut builder,
         state,
-        USB_PACKET_SIZE as u16,
+        USB_MAX_PACKET_SIZE as u16,
         uac1::SampleWidth::Width4Byte,
         &[SAMPLE_RATE_HZ],
         &[uac1::Channel::LeftFront, uac1::Channel::RightFront],
@@ -542,26 +567,33 @@ async fn main(spawner: Spawner) {
         cortex_m::peripheral::NVIC::unmask(interrupt::TIM2);
     }
 
-    let source_subscriber_0 = SOURCE_CHANNEL.subscriber().unwrap();
-    let source_subscriber_1 = SOURCE_CHANNEL.subscriber().unwrap();
+    let source_subscriber_routing = SOURCE_CHANNEL.subscriber().unwrap();
+    let source_subscriber_volume = SOURCE_CHANNEL.subscriber().unwrap();
     let source_publisher = SOURCE_CHANNEL.publisher().unwrap();
 
-    // FIXME: decide, based on input levels.
-    source_publisher.publish_immediate(AudioSource::Usb);
+    // Launch USB audio tasks.
+    unwrap!(spawner.spawn(usb_audio::control_task(control_changed)));
+    unwrap!(spawner.spawn(usb_audio::streaming_task(stream, sender)));
+    unwrap!(spawner.spawn(usb_audio::feedback_task(feedback)));
+    unwrap!(spawner.spawn(usb_audio::usb_task(usb_device)));
 
-    unwrap!(spawner.spawn(usb_audio::control_task(control_changed, led_yellow)));
-    unwrap!(spawner.spawn(usb_audio::streaming_task(stream, feedback, sender, usb_device)));
+    unwrap!(spawner.spawn(audio_routing::source_control_task(
+        source_publisher,
+        led_red,
+        led_yellow,
+        led_green
+    )));
     unwrap!(spawner.spawn(audio_routing::audio_routing_task(
         get_filters(),
         sai4_resources,
         receiver,
-        source_subscriber_0,
-        led_blue
+        source_subscriber_routing,
     )));
-    unwrap!(spawner.spawn(volume_task(source_subscriber_1)));
+
+    unwrap!(spawner.spawn(volume_task(source_subscriber_volume)));
     unwrap!(spawner.spawn(potentiometer_task(adc_resources)));
     unwrap!(spawner.spawn(amplifier_task(amplifier_resources)));
-    unwrap!(spawner.spawn(heartbeat_task(led_red)));
+    unwrap!(spawner.spawn(heartbeat_task(led_blue)));
 }
 
 #[interrupt]
@@ -586,7 +618,7 @@ fn TIM2() {
         *FRAME_COUNT += 1;
         if *FRAME_COUNT >= FEEDBACK_REFRESH_PERIOD.frame_count() {
             *FRAME_COUNT = 0;
-            FEEDBACK_SIGNAL.signal(ticks - *LAST_TICKS);
+            FEEDBACK_SIGNAL.signal(ticks.wrapping_sub(*LAST_TICKS));
             *LAST_TICKS = ticks;
         }
     });

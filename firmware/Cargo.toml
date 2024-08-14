@@ -4,6 +4,12 @@ name = "blus-fw"
 version = "0.1.0"
 license = "GPL-3.0"
 
+[features]
+# Enables USB high-speed operation (instead of full-speed)
+usb_high_speed = []
+
+default = []
+
 [dependencies]
 biquad = { version = "0.4.2" }
 embassy-stm32 = { version = "0.1.0", path = "../embassy/embassy-stm32", features = [
