@@ -224,23 +224,23 @@ pub async fn audio_routing_task(
     sai_rpi.start();
 
     loop {
-        // Check, if there is a signal stream arriving from the Raspberry Pi header.
-        RPI_IS_STREAMING.store(!sai_rpi.is_muted().unwrap(), Relaxed);
-
         // Update the audio source.
         if let Some(message) = source_subscriber.try_next_message_pure() {
             source = message;
+
+            // Wait for the gain of the new source.
+            (gain_left, gain_right) = GAIN_SIGNAL.wait().await;
+        } else {
+            // Try to update the gain level.
+            if let Some(gain) = GAIN_SIGNAL.try_take() {
+                (gain_left, gain_right) = gain;
+            }
         }
 
-        // Update the gain level.
-        if let Some(gain) = GAIN_SIGNAL.try_take() {
-            (gain_left, gain_right) = gain;
-
-            if gain_left == 0.0 && gain_right == 0.0 {
-                sai_amp.set_mute(true);
-            } else {
-                sai_amp.set_mute(false);
-            }
+        if gain_left == 0.0 && gain_right == 0.0 {
+            sai_amp.set_mute(true);
+        } else {
+            sai_amp.set_mute(false);
         }
 
         let renew = match source {
@@ -310,5 +310,8 @@ pub async fn audio_routing_task(
 
             SAI_ACTIVE_SIGNAL.signal(true);
         }
+
+        // Check, if there is a signal stream arriving from the Raspberry Pi header.
+        RPI_IS_STREAMING.store(!sai_rpi.is_muted().unwrap(), Relaxed);
     }
 }
