@@ -1,3 +1,4 @@
+use core::sync::atomic::Ordering::Relaxed;
 use defmt::{info, panic};
 use embassy_stm32::gpio::Output;
 use embassy_stm32::{peripherals, sai};
@@ -161,39 +162,25 @@ pub async fn source_control_task(
 
     let mut source = AudioSource::None;
 
-    let mut rpi_streaming: bool = false;
-    let mut usb_streaming: bool = false;
-
     loop {
-        ticker.next().await;
-
         for led in [&mut led_usb, &mut led_rpi, &mut led_ext] {
             led.set_low();
         }
 
-        match source {
-            AudioSource::Usb => led_usb.set_high(),
-            AudioSource::RaspberryPi => led_rpi.set_high(),
-            _ => (),
-        }
-        source_publisher.publish_immediate(source);
-
-        if let Some(enabled) = USB_STREAMING_SIGNAL.try_take() {
-            usb_streaming = enabled;
-        }
-
-        if let Some(enabled) = RPI_STREAMING_SIGNAL.try_take() {
-            rpi_streaming = enabled;
-        }
-
         // Source prioritization is determined by the order of checks.
-        if rpi_streaming {
+        if RPI_IS_STREAMING.load(Relaxed) {
+            led_rpi.set_high();
             source = AudioSource::RaspberryPi;
-        } else if usb_streaming {
+        } else if USB_IS_STREAMING.load(Relaxed) {
+            led_usb.set_high();
             source = AudioSource::Usb;
         } else {
             // Do not change source.
         }
+
+        source_publisher.publish_immediate(source);
+
+        ticker.next().await;
     }
 }
 
@@ -238,7 +225,7 @@ pub async fn audio_routing_task(
 
     loop {
         // Check, if there is a signal stream arriving from the Raspberry Pi header.
-        RPI_STREAMING_SIGNAL.signal(!sai_rpi.is_muted().unwrap());
+        RPI_IS_STREAMING.store(!sai_rpi.is_muted().unwrap(), Relaxed);
 
         // Update the audio source.
         if let Some(message) = source_subscriber.try_next_message_pure() {

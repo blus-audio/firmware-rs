@@ -1,3 +1,4 @@
+use core::sync::atomic::Ordering::Relaxed;
 use defmt::{debug, panic};
 use embassy_stm32::{peripherals, usb};
 use embassy_sync::blocking_mutex::raw::NoopRawMutex;
@@ -103,9 +104,9 @@ pub async fn streaming_task(
 ) {
     loop {
         stream.wait_connection().await;
-        USB_STREAMING_SIGNAL.signal(true);
+        USB_IS_STREAMING.store(true, Relaxed);
         _ = stream_handler(&mut stream, &mut sender).await;
-        USB_STREAMING_SIGNAL.signal(false);
+        USB_IS_STREAMING.store(false, Relaxed);
     }
 }
 

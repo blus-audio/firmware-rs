@@ -5,6 +5,8 @@ pub mod audio_routing;
 pub mod tas2780;
 pub mod usb_audio;
 
+use core::sync::atomic::AtomicBool;
+
 use embassy_sync::blocking_mutex::raw::{CriticalSectionRawMutex, ThreadModeRawMutex};
 use embassy_sync::pubsub::{PubSubChannel, Publisher, Subscriber};
 use embassy_sync::signal::Signal;
@@ -53,9 +55,10 @@ pub const FEEDBACK_REFRESH_PERIOD: uac1::FeedbackRefresh = uac1::FeedbackRefresh
 pub const USB_MAX_PACKET_SIZE: usize = 2 * USB_FRAME_SIZE;
 pub const USB_MAX_SAMPLE_COUNT: usize = USB_MAX_PACKET_SIZE / SAMPLE_SIZE;
 
-// Signals and channels for task communication
-pub static USB_STREAMING_SIGNAL: Signal<ThreadModeRawMutex, bool> = Signal::new();
-pub static RPI_STREAMING_SIGNAL: Signal<ThreadModeRawMutex, bool> = Signal::new();
+// Task communication
+pub static USB_IS_STREAMING: AtomicBool = AtomicBool::new(false);
+pub static RPI_IS_STREAMING: AtomicBool = AtomicBool::new(false);
+
 pub static FEEDBACK_SIGNAL: Signal<CriticalSectionRawMutex, u32> = Signal::new();
 pub static SAI_ACTIVE_SIGNAL: Signal<ThreadModeRawMutex, bool> = Signal::new();
 pub static USB_VOLUME_SIGNAL: Signal<ThreadModeRawMutex, Vec<uac1::speaker::Volume, INPUT_CHANNEL_COUNT>> =
