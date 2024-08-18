@@ -1,5 +1,4 @@
 use defmt::{debug, panic};
-use embassy_stm32::gpio::Output;
 use embassy_stm32::{peripherals, usb};
 use embassy_sync::blocking_mutex::raw::NoopRawMutex;
 use embassy_sync::zerocopy_channel;

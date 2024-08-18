@@ -3,8 +3,9 @@ use embassy_stm32::gpio::Output;
 use embassy_stm32::{peripherals, sai};
 use embassy_sync::blocking_mutex::raw::NoopRawMutex;
 use embassy_sync::zerocopy_channel;
-use embassy_time::{Duration, Timer, WithTimeout};
+use embassy_time::{Duration, Ticker, Timer, WithTimeout};
 use grounded::uninit::GroundedArrayCell;
+use static_assertions;
 
 use crate::*;
 
@@ -13,6 +14,11 @@ const SAI_AMP_SAMPLE_COUNT: usize = 2 * USB_MAX_SAMPLE_COUNT;
 
 // Buffer of around 10 ms size
 const SAI_RPI_SAMPLE_COUNT: usize = SAMPLE_SIZE_PER_S.div_ceil(1000) / SAMPLE_SIZE;
+
+// Do not exceed the write buffer (after processing) with samples from the Raspberry Pi.
+static_assertions::const_assert!(
+    SAI_RPI_SAMPLE_COUNT <= (OUTPUT_CHANNEL_COUNT / INPUT_CHANNEL_COUNT) * SAI_AMP_SAMPLE_COUNT
+);
 
 #[allow(unused)]
 pub struct Sai1Resources {
@@ -90,13 +96,12 @@ fn new_sai4<'d>(
 
     let sai4_b_driver = {
         let mut config = sai::Config::default();
-        const CHANNEL_COUNT: usize = 2;
+        const CHANNEL_COUNT: usize = INPUT_CHANNEL_COUNT;
 
         config.tx_rx = sai::TxRx::Receiver;
         config.slot_count = sai::word::U4(CHANNEL_COUNT as u8);
         config.slot_enable = 0xFFFF; // All slots
         config.data_size = sai::DataSize::Data32;
-        // config.frame_sync_definition = sai::FrameSyncDefinition::StartOfFrame;
         config.frame_length = (CHANNEL_COUNT * SAMPLE_WIDTH_BIT) as u8;
         config.frame_sync_active_level_length = sai::word::U7(SAMPLE_WIDTH_BIT as u8);
         config.bit_order = sai::BitOrder::MsbFirst;
@@ -151,9 +156,17 @@ pub async fn source_control_task(
     mut led_rpi: Output<'static>,
     mut led_ext: Output<'static>,
 ) {
-    let mut source = AudioSource::RaspberryPi;
+    // The speed at which source changes are performed.
+    let mut ticker = Ticker::every(Duration::from_millis(50));
+
+    let mut source = AudioSource::None;
+
+    let mut rpi_streaming: bool = false;
+    let mut usb_streaming: bool = false;
 
     loop {
+        ticker.next().await;
+
         for led in [&mut led_usb, &mut led_rpi, &mut led_ext] {
             led.set_low();
         }
@@ -164,12 +177,22 @@ pub async fn source_control_task(
             _ => (),
         }
         source_publisher.publish_immediate(source);
-        let usb_signal = USB_STREAMING_SIGNAL.wait().await;
 
-        if usb_signal {
+        if let Some(enabled) = USB_STREAMING_SIGNAL.try_take() {
+            usb_streaming = enabled;
+        }
+
+        if let Some(enabled) = RPI_STREAMING_SIGNAL.try_take() {
+            rpi_streaming = enabled;
+        }
+
+        // Source prioritization is determined by the order of checks.
+        if rpi_streaming {
+            source = AudioSource::RaspberryPi;
+        } else if usb_streaming {
             source = AudioSource::Usb;
         } else {
-            source = AudioSource::RaspberryPi;
+            // Do not change source.
         }
     }
 }
@@ -208,16 +231,21 @@ pub async fn audio_routing_task(
 
     let mut rpi_samples = [0u32; SAI_RPI_SAMPLE_COUNT];
 
-    let mut source = AudioSource::RaspberryPi;
+    let mut source = AudioSource::None;
 
     sai_amp.start();
     sai_rpi.start();
 
     loop {
+        // Check, if there is a signal stream arriving from the Raspberry Pi header.
+        RPI_STREAMING_SIGNAL.signal(!sai_rpi.is_muted().unwrap());
+
+        // Update the audio source.
         if let Some(message) = source_subscriber.try_next_message_pure() {
             source = message;
         }
 
+        // Update the gain level.
         if let Some(gain) = GAIN_SIGNAL.try_take() {
             (gain_left, gain_right) = gain;
 
@@ -255,27 +283,27 @@ pub async fn audio_routing_task(
                     .with_timeout(Duration::from_millis(10))
                     .await;
 
-                match result {
-                    Ok(samples) => {
-                        let mut processed_samples = [0u32; 2 * USB_MAX_SAMPLE_COUNT];
-                        let output_sample_count =
-                            process(samples, &mut processed_samples, &mut filters, gain_left, gain_right);
-                        let result = sai_amp.write(&processed_samples[..output_sample_count]).await;
+                if let Ok(samples) = result {
+                    let mut processed_samples = [0u32; 2 * USB_MAX_SAMPLE_COUNT];
+                    let output_sample_count =
+                        process(samples, &mut processed_samples, &mut filters, gain_left, gain_right);
+                    let result = sai_amp.write(&processed_samples[..output_sample_count]).await;
 
-                        // Notify the channel that the buffer is now ready to be reused
-                        usb_audio_receiver.receive_done();
+                    // Notify the channel that the buffer is now ready to be reused
+                    usb_audio_receiver.receive_done();
 
-                        result.is_err()
-                    }
-                    Err(_) => true,
+                    result.is_err()
+                } else {
+                    false
                 }
             }
             _ => {
                 Timer::after_millis(100).await;
-                true
+                false
             }
         };
 
+        // Renew the SAI setup in case of errors.
         if renew {
             SAI_ACTIVE_SIGNAL.signal(false);
             info!("Renew SAI setup.");

@@ -577,6 +577,7 @@ async fn main(spawner: Spawner) {
     unwrap!(spawner.spawn(usb_audio::feedback_task(feedback)));
     unwrap!(spawner.spawn(usb_audio::usb_task(usb_device)));
 
+    // Launch audio routing tasks.
     unwrap!(spawner.spawn(audio_routing::source_control_task(
         source_publisher,
         led_red,
@@ -590,9 +591,14 @@ async fn main(spawner: Spawner) {
         source_subscriber_routing,
     )));
 
-    unwrap!(spawner.spawn(volume_task(source_subscriber_volume)));
+    // Volume control.
     unwrap!(spawner.spawn(potentiometer_task(adc_resources)));
+    unwrap!(spawner.spawn(volume_task(source_subscriber_volume)));
+
+    // Amplifier setup and control.
     unwrap!(spawner.spawn(amplifier_task(amplifier_resources)));
+
+    // A steady heartbeat signal.
     unwrap!(spawner.spawn(heartbeat_task(led_blue)));
 }
 

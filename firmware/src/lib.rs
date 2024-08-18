@@ -55,6 +55,7 @@ pub const USB_MAX_SAMPLE_COUNT: usize = USB_MAX_PACKET_SIZE / SAMPLE_SIZE;
 
 // Signals and channels for task communication
 pub static USB_STREAMING_SIGNAL: Signal<ThreadModeRawMutex, bool> = Signal::new();
+pub static RPI_STREAMING_SIGNAL: Signal<ThreadModeRawMutex, bool> = Signal::new();
 pub static FEEDBACK_SIGNAL: Signal<CriticalSectionRawMutex, u32> = Signal::new();
 pub static SAI_ACTIVE_SIGNAL: Signal<ThreadModeRawMutex, bool> = Signal::new();
 pub static USB_VOLUME_SIGNAL: Signal<ThreadModeRawMutex, Vec<uac1::speaker::Volume, INPUT_CHANNEL_COUNT>> =
