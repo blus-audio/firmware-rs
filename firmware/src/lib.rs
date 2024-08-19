@@ -6,9 +6,9 @@ pub mod tas2780;
 pub mod usb_audio;
 
 use core::sync::atomic::AtomicBool;
+use micromath::F32Ext;
 
 use embassy_sync::blocking_mutex::raw::{CriticalSectionRawMutex, ThreadModeRawMutex};
-use embassy_sync::pubsub::{PubSubChannel, Publisher, Subscriber};
 use embassy_sync::signal::Signal;
 use embassy_usb::class::uac1;
 use heapless::Vec;
@@ -34,6 +34,8 @@ pub const SAMPLE_WIDTH: uac1::SampleWidth = uac1::SampleWidth::Width4Byte;
 pub const SAMPLE_WIDTH_BIT: usize = SAMPLE_WIDTH.in_bit();
 pub const SAMPLE_SIZE: usize = SAMPLE_WIDTH as usize;
 pub const SAMPLE_SIZE_PER_S: usize = (SAMPLE_RATE_HZ as usize) * INPUT_CHANNEL_COUNT * SAMPLE_SIZE;
+
+pub const AUDIO_CHANNELS: [uac1::Channel; INPUT_CHANNEL_COUNT] = [uac1::Channel::LeftFront, uac1::Channel::RightFront];
 
 // Size of audio samples per 1 ms - suitable for full-speed USB
 #[cfg(not(feature = "usb_high_speed"))]
@@ -61,16 +63,17 @@ pub static RPI_IS_STREAMING: AtomicBool = AtomicBool::new(false);
 
 pub static FEEDBACK_SIGNAL: Signal<CriticalSectionRawMutex, u32> = Signal::new();
 pub static SAI_ACTIVE_SIGNAL: Signal<ThreadModeRawMutex, bool> = Signal::new();
-pub static USB_VOLUME_SIGNAL: Signal<ThreadModeRawMutex, Vec<uac1::speaker::Volume, INPUT_CHANNEL_COUNT>> =
-    Signal::new();
-pub static GAIN_SIGNAL: Signal<ThreadModeRawMutex, (f32, f32)> = Signal::new();
 
-pub static SOURCE_CHANNEL: PubSubChannel<ThreadModeRawMutex, AudioSource, 1, 2, 1> = PubSubChannel::new();
+pub static USB_GAIN_SIGNAL: Signal<ThreadModeRawMutex, (f32, f32)> = Signal::new();
+pub static POT_GAIN_SIGNAL: Signal<ThreadModeRawMutex, f32> = Signal::new();
 
-pub type SourceSubscriber = Subscriber<'static, ThreadModeRawMutex, AudioSource, 1, 2, 1>;
-pub type SourcePublisher = Publisher<'static, ThreadModeRawMutex, AudioSource, 1, 2, 1>;
+pub static AUDIO_SOURCE_SIGNAL: Signal<ThreadModeRawMutex, AudioSource> = Signal::new();
 
 // Type definitions
 pub type SampleBlock = Vec<u32, USB_MAX_SAMPLE_COUNT>;
 pub type BiquadType = biquad::DirectForm2Transposed<f32>;
 pub type AudioFilter<'d> = audio_filter::Filter<'d, BiquadType>;
+
+pub fn db_to_linear(db: f32) -> f32 {
+    10.0f32.powf(db / 20.0)
+}

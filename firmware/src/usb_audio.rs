@@ -128,13 +128,34 @@ pub async fn control_task(control_monitor: speaker::ControlMonitor<'static>) {
     loop {
         control_monitor.changed().await;
 
-        let mut volumes = Vec::new();
-        volumes
-            .push(control_monitor.volume(uac1::Channel::LeftFront).unwrap())
-            .unwrap();
-        volumes
-            .push(control_monitor.volume(uac1::Channel::RightFront).unwrap())
-            .unwrap();
-        USB_VOLUME_SIGNAL.signal(volumes);
+        let mut usb_gain_left = 0.0_f32;
+        let mut usb_gain_right = 0.0_f32;
+
+        for channel in AUDIO_CHANNELS {
+            let volume = control_monitor.volume(channel).unwrap();
+
+            let gain = match volume {
+                speaker::Volume::Muted => 0.0,
+                speaker::Volume::DeciBel(volume_db) => {
+                    if volume_db > 0.0 {
+                        panic!("Volume must not be positive.")
+                    }
+
+                    db_to_linear(volume_db)
+                }
+            };
+
+            match channel {
+                uac1::Channel::LeftFront => {
+                    usb_gain_left = gain;
+                }
+                uac1::Channel::RightFront => {
+                    usb_gain_right = gain;
+                }
+                _ => (),
+            }
+        }
+
+        USB_GAIN_SIGNAL.signal((usb_gain_left, usb_gain_right));
     }
 }

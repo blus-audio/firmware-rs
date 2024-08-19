@@ -2,21 +2,18 @@
 #![no_main]
 
 use core::cell::RefCell;
-use core::panic;
 
 use blus_fw::*;
 use defmt::{debug, info, unwrap};
 use embassy_embedded_hal::shared_bus::blocking::i2c::I2cDevice;
 use embassy_executor::Spawner;
-use embassy_futures::select::{select3, Either3};
 use embassy_stm32::adc::{self, AdcChannel};
 use embassy_stm32::gpio::{Input, Level, Output, Pull, Speed};
 use embassy_stm32::mode::Async;
 use embassy_stm32::time::Hertz;
 use embassy_stm32::{bind_interrupts, i2c, interrupt, peripherals, timer, usb};
-use embassy_sync::blocking_mutex::raw::{CriticalSectionRawMutex, NoopRawMutex, ThreadModeRawMutex};
+use embassy_sync::blocking_mutex::raw::{CriticalSectionRawMutex, NoopRawMutex};
 use embassy_sync::blocking_mutex::{Mutex, NoopMutex};
-use embassy_sync::signal::Signal;
 use embassy_sync::zerocopy_channel;
 use embassy_time::{Duration, Ticker, Timer};
 use embassy_usb::class::uac1;
@@ -34,7 +31,6 @@ bind_interrupts!(struct Irqs {
     I2C1_ER => i2c::ErrorInterruptHandler<peripherals::I2C1>;
 });
 
-static POT_GAIN_SIGNAL: Signal<ThreadModeRawMutex, f32> = Signal::new();
 static TIMER: Mutex<CriticalSectionRawMutex, RefCell<Option<timer::low_level::Timer<peripherals::TIM2>>>> =
     Mutex::new(RefCell::new(None));
 static I2C_BUS: StaticCell<NoopMutex<RefCell<i2c::I2c<'static, Async>>>> = StaticCell::new();
@@ -55,10 +51,6 @@ struct AdcResources<T: adc::Instance> {
     adc: adc::Adc<'static, T>,
     pin: adc::AnyAdcChannel<T>,
     dma: peripherals::DMA1_CH0,
-}
-
-pub fn db_to_linear(db: f32) -> f32 {
-    10.0f32.powf(db / 20.0)
 }
 
 pub fn get_filters() -> [AudioFilter<'static>; OUTPUT_CHANNEL_COUNT] {
@@ -148,61 +140,6 @@ pub fn get_filters() -> [AudioFilter<'static>; OUTPUT_CHANNEL_COUNT] {
     let f_d = AudioFilter::new(gain_d, delay_d, biquads_d);
 
     [f_a, f_b, f_c, f_d]
-}
-
-#[embassy_executor::task]
-async fn volume_task(mut source_subscriber: SourceSubscriber) {
-    // Linear gains for different sources.
-    let mut pot_gain = 0.0_f32;
-    let mut usb_gain_left = 0.0_f32;
-    let mut usb_gain_right = 0.0_f32;
-    let mut audio_source = AudioSource::None;
-
-    loop {
-        let usb_volume_fut = USB_VOLUME_SIGNAL.wait();
-        let pot_gain_fut = POT_GAIN_SIGNAL.wait();
-        let source_fut = source_subscriber.next_message_pure();
-
-        match select3(usb_volume_fut, pot_gain_fut, source_fut).await {
-            Either3::First(volumes) => {
-                for volume in volumes {
-                    let (channel, gain) = match volume {
-                        speaker::Volume::Muted(channel) => (channel, 0.0),
-                        speaker::Volume::DeciBel(channel, volume_db) => {
-                            if volume_db > 0.0 {
-                                panic!("Volume must not be positive.")
-                            }
-
-                            (channel, db_to_linear(volume_db))
-                        }
-                    };
-
-                    match channel {
-                        uac1::Channel::LeftFront => {
-                            usb_gain_left = gain;
-                        }
-                        uac1::Channel::RightFront => {
-                            usb_gain_right = gain;
-                        }
-                        _ => (),
-                    }
-                }
-            }
-            Either3::Second(gain) => {
-                pot_gain = gain;
-            }
-            Either3::Third(_audio_source) => audio_source = _audio_source,
-        };
-
-        let (gain_left, gain_right) = match audio_source {
-            AudioSource::Usb => (usb_gain_left, usb_gain_right),
-            AudioSource::Spdif => (pot_gain, pot_gain),
-            AudioSource::RaspberryPi => (pot_gain, pot_gain),
-            _ => (0.0, 0.0),
-        };
-
-        GAIN_SIGNAL.signal((gain_left, gain_right));
-    }
 }
 
 #[embassy_executor::task]
@@ -502,7 +439,7 @@ async fn main(spawner: Spawner) {
         USB_MAX_PACKET_SIZE as u16,
         uac1::SampleWidth::Width4Byte,
         &[SAMPLE_RATE_HZ],
-        &[uac1::Channel::LeftFront, uac1::Channel::RightFront],
+        &AUDIO_CHANNELS,
         FEEDBACK_REFRESH_PERIOD,
     );
 
@@ -567,10 +504,6 @@ async fn main(spawner: Spawner) {
         cortex_m::peripheral::NVIC::unmask(interrupt::TIM2);
     }
 
-    let source_subscriber_routing = SOURCE_CHANNEL.subscriber().unwrap();
-    let source_subscriber_volume = SOURCE_CHANNEL.subscriber().unwrap();
-    let source_publisher = SOURCE_CHANNEL.publisher().unwrap();
-
     // Launch USB audio tasks.
     unwrap!(spawner.spawn(usb_audio::control_task(control_changed)));
     unwrap!(spawner.spawn(usb_audio::streaming_task(stream, sender)));
@@ -578,22 +511,15 @@ async fn main(spawner: Spawner) {
     unwrap!(spawner.spawn(usb_audio::usb_task(usb_device)));
 
     // Launch audio routing tasks.
-    unwrap!(spawner.spawn(audio_routing::source_control_task(
-        source_publisher,
-        led_red,
-        led_yellow,
-        led_green
-    )));
+    unwrap!(spawner.spawn(audio_routing::source_control_task(led_red, led_yellow, led_green)));
     unwrap!(spawner.spawn(audio_routing::audio_routing_task(
         get_filters(),
         sai4_resources,
         receiver,
-        source_subscriber_routing,
     )));
 
     // Volume control.
     unwrap!(spawner.spawn(potentiometer_task(adc_resources)));
-    unwrap!(spawner.spawn(volume_task(source_subscriber_volume)));
 
     // Amplifier setup and control.
     unwrap!(spawner.spawn(amplifier_task(amplifier_resources)));

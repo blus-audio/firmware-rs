@@ -152,7 +152,6 @@ fn process(
 
 #[embassy_executor::task]
 pub async fn source_control_task(
-    source_publisher: SourcePublisher,
     mut led_usb: Output<'static>,
     mut led_rpi: Output<'static>,
     mut led_ext: Output<'static>,
@@ -178,7 +177,7 @@ pub async fn source_control_task(
             // Do not change source.
         }
 
-        source_publisher.publish_immediate(source);
+        AUDIO_SOURCE_SIGNAL.signal(source);
 
         ticker.next().await;
     }
@@ -189,7 +188,6 @@ pub async fn audio_routing_task(
     mut filters: [AudioFilter<'static>; OUTPUT_CHANNEL_COUNT],
     mut sai4_resources: Sai4Resources,
     mut usb_audio_receiver: zerocopy_channel::Receiver<'static, NoopRawMutex, SampleBlock>,
-    mut source_subscriber: SourceSubscriber,
 ) {
     info!("Amplifier SAI write buffer size: {} samples", SAI_AMP_SAMPLE_COUNT);
     info!("Raspberry Pi SAI read buffer size: {} samples", SAI_RPI_SAMPLE_COUNT);
@@ -225,26 +223,17 @@ pub async fn audio_routing_task(
 
     loop {
         // Update the audio source.
-        if let Some(message) = source_subscriber.try_next_message_pure() {
+        if let Some(message) = AUDIO_SOURCE_SIGNAL.try_take() {
             source = message;
-
-            // Wait for the gain of the new source.
-            (gain_left, gain_right) = GAIN_SIGNAL.wait().await;
-        } else {
-            // Try to update the gain level.
-            if let Some(gain) = GAIN_SIGNAL.try_take() {
-                (gain_left, gain_right) = gain;
-            }
-        }
-
-        if gain_left == 0.0 && gain_right == 0.0 {
-            sai_amp.set_mute(true);
-        } else {
-            sai_amp.set_mute(false);
         }
 
         let renew = match source {
             AudioSource::RaspberryPi => {
+                if let Some(gain) = POT_GAIN_SIGNAL.try_take() {
+                    gain_left = gain;
+                    gain_right = gain;
+                }
+
                 let result = sai_rpi.read(&mut rpi_samples).await;
 
                 if result.is_err() {
@@ -265,6 +254,10 @@ pub async fn audio_routing_task(
                 }
             }
             AudioSource::Usb => {
+                if let Some(gain) = USB_GAIN_SIGNAL.try_take() {
+                    (gain_left, gain_right) = gain;
+                }
+
                 let result = usb_audio_receiver
                     .receive()
                     .with_timeout(Duration::from_millis(10))
@@ -289,6 +282,12 @@ pub async fn audio_routing_task(
                 false
             }
         };
+
+        if gain_left == 0.0 && gain_right == 0.0 {
+            sai_amp.set_mute(true);
+        } else {
+            sai_amp.set_mute(false);
+        }
 
         // Renew the SAI setup in case of errors.
         if renew {
