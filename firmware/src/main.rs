@@ -20,7 +20,6 @@ use embassy_usb::class::uac1;
 use embassy_usb::class::uac1::speaker::{self, Speaker};
 use grounded::uninit::GroundedArrayCell;
 use heapless::Vec;
-use libm::{fabsf, roundf};
 use micromath::F32Ext;
 use static_cell::StaticCell;
 use {defmt_rtt as _, panic_probe as _};
@@ -230,20 +229,13 @@ async fn amplifier_task(amplifier_resources: AmplifierResources) {
 }
 
 #[embassy_executor::task]
-async fn heartbeat_task(mut status_led: Output<'static>) {
-    let mut ticker = Ticker::every(Duration::from_secs(3));
-
-    loop {
-        ticker.next().await;
-        status_led.set_high();
-        Timer::after_millis(50).await;
-        status_led.set_low();
-    }
-}
-
-#[embassy_executor::task]
 async fn potentiometer_task(mut adc_resources: AdcResources<peripherals::ADC1>) {
-    let mut ticker = Ticker::every(Duration::from_hz(10));
+    use biquad::*;
+
+    const POT_SAMPLE_RATE_HZ: u64 = 25;
+    const POT_CUT_OFF_HZ: f32 = 5.0;
+
+    let mut ticker = Ticker::every(Duration::from_hz(POT_SAMPLE_RATE_HZ));
 
     let buffer: &mut [u16] = unsafe {
         ADC1_MEASUREMENT_BUFFER.initialize_all_copied(0);
@@ -251,7 +243,15 @@ async fn potentiometer_task(mut adc_resources: AdcResources<peripherals::ADC1>) 
         core::slice::from_raw_parts_mut(ptr, len)
     };
 
-    let mut gain = 0.0;
+    let coefficients = Coefficients::<f32>::from_params(
+        Type::LowPass,
+        (POT_SAMPLE_RATE_HZ as f32).hz(),
+        POT_CUT_OFF_HZ.hz(),
+        0.5,
+    )
+    .unwrap();
+
+    let mut filter = DirectForm2Transposed::<f32>::new(coefficients);
 
     loop {
         ticker.next().await;
@@ -265,19 +265,18 @@ async fn potentiometer_task(mut adc_resources: AdcResources<peripherals::ADC1>) 
             )
             .await;
 
-        // Ranges from 0.0 to 1.0.
-        let measured = (buffer[0] as f32) / 65535f32;
+        let mut gain = filter.run((buffer[0] as f32) / 65535f32);
 
-        // Round to steps of 0.05.
-        let rounded = roundf(20.0 * measured) / 20.0;
-
-        if fabsf(gain - measured) >= 0.04 {
-            gain = rounded;
-
-            // Make gain exponential
-            let exp_gain = gain.powf(2.0);
-            POT_GAIN_SIGNAL.signal(exp_gain);
+        // Clamping.
+        if gain < 0.0 {
+            gain = 0.0;
+        } else if gain > 1.0 {
+            gain = 1.0;
         }
+
+        // Make gain exponential
+        let exp_gain = gain.powf(2.0);
+        POT_GAIN_SIGNAL.signal(exp_gain);
     }
 }
 
@@ -510,12 +509,15 @@ async fn main(spawner: Spawner) {
     unwrap!(spawner.spawn(usb_audio::feedback_task(feedback)));
     unwrap!(spawner.spawn(usb_audio::usb_task(usb_device)));
 
-    // Launch audio routing tasks.
-    unwrap!(spawner.spawn(audio_routing::source_control_task(led_red, led_yellow, led_green)));
+    // Launch audio routing.
     unwrap!(spawner.spawn(audio_routing::audio_routing_task(
         get_filters(),
         sai4_resources,
         receiver,
+        led_blue,
+        led_red,
+        led_yellow,
+        led_green
     )));
 
     // Volume control.
@@ -523,9 +525,6 @@ async fn main(spawner: Spawner) {
 
     // Amplifier setup and control.
     unwrap!(spawner.spawn(amplifier_task(amplifier_resources)));
-
-    // A steady heartbeat signal.
-    unwrap!(spawner.spawn(heartbeat_task(led_blue)));
 }
 
 #[interrupt]

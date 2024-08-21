@@ -4,7 +4,7 @@ use embassy_stm32::gpio::Output;
 use embassy_stm32::{peripherals, sai};
 use embassy_sync::blocking_mutex::raw::NoopRawMutex;
 use embassy_sync::zerocopy_channel;
-use embassy_time::{Duration, Ticker, Timer, WithTimeout};
+use embassy_time::{Duration, Timer, WithTimeout};
 use grounded::uninit::GroundedArrayCell;
 use static_assertions;
 
@@ -151,43 +151,14 @@ fn process(
 }
 
 #[embassy_executor::task]
-pub async fn source_control_task(
-    mut led_usb: Output<'static>,
-    mut led_rpi: Output<'static>,
-    mut led_ext: Output<'static>,
-) {
-    // The speed at which source changes are performed.
-    let mut ticker = Ticker::every(Duration::from_millis(50));
-
-    let mut source = AudioSource::None;
-
-    loop {
-        for led in [&mut led_usb, &mut led_rpi, &mut led_ext] {
-            led.set_low();
-        }
-
-        // Source prioritization is determined by the order of checks.
-        if RPI_IS_STREAMING.load(Relaxed) {
-            led_rpi.set_high();
-            source = AudioSource::RaspberryPi;
-        } else if USB_IS_STREAMING.load(Relaxed) {
-            led_usb.set_high();
-            source = AudioSource::Usb;
-        } else {
-            // Do not change source.
-        }
-
-        AUDIO_SOURCE_SIGNAL.signal(source);
-
-        ticker.next().await;
-    }
-}
-
-#[embassy_executor::task]
 pub async fn audio_routing_task(
     mut filters: [AudioFilter<'static>; OUTPUT_CHANNEL_COUNT],
     mut sai4_resources: Sai4Resources,
     mut usb_audio_receiver: zerocopy_channel::Receiver<'static, NoopRawMutex, SampleBlock>,
+    mut status_led: Output<'static>,
+    mut led_usb: Output<'static>,
+    mut led_rpi: Output<'static>,
+    mut led_ext: Output<'static>,
 ) {
     info!("Amplifier SAI write buffer size: {} samples", SAI_AMP_SAMPLE_COUNT);
     info!("Raspberry Pi SAI read buffer size: {} samples", SAI_RPI_SAMPLE_COUNT);
@@ -211,29 +182,33 @@ pub async fn audio_routing_task(
         SAMPLE_RATE_HZ,
     );
 
-    let mut gain_left = 0.0;
-    let mut gain_right = 0.0;
+    let mut usb_gain = (0.0, 0.0);
+    let mut _pot_gain = (0.0, 0.0);
 
     let mut rpi_samples = [0u32; SAI_RPI_SAMPLE_COUNT];
-
-    let mut source = AudioSource::None;
 
     sai_amp.start();
     sai_rpi.start();
 
     loop {
         // Update the audio source.
-        if let Some(message) = AUDIO_SOURCE_SIGNAL.try_take() {
-            source = message;
+        for led in [&mut led_usb, &mut led_rpi, &mut led_ext] {
+            led.set_low();
         }
+
+        // Source prioritization is determined by the order of checks.
+        let source = if RPI_IS_STREAMING.load(Relaxed) {
+            led_rpi.set_high();
+            AudioSource::RaspberryPi
+        } else if USB_IS_STREAMING.load(Relaxed) {
+            led_usb.set_high();
+            AudioSource::Usb
+        } else {
+            AudioSource::None
+        };
 
         let renew = match source {
             AudioSource::RaspberryPi => {
-                if let Some(gain) = POT_GAIN_SIGNAL.try_take() {
-                    gain_left = gain;
-                    gain_right = gain;
-                }
-
                 let result = sai_rpi.read(&mut rpi_samples).await;
 
                 if result.is_err() {
@@ -241,13 +216,9 @@ pub async fn audio_routing_task(
                 } else {
                     let mut processed_samples = [0u32; 2 * SAI_RPI_SAMPLE_COUNT];
 
-                    let output_sample_count = process(
-                        &rpi_samples,
-                        &mut processed_samples,
-                        &mut filters,
-                        gain_left,
-                        gain_right,
-                    );
+                    status_led.set_high();
+                    let output_sample_count = process(&rpi_samples, &mut processed_samples, &mut filters, 1.0, 1.0);
+                    status_led.set_low();
 
                     let result = sai_amp.write(&processed_samples[..output_sample_count]).await;
                     result.is_err()
@@ -255,18 +226,23 @@ pub async fn audio_routing_task(
             }
             AudioSource::Usb => {
                 if let Some(gain) = USB_GAIN_SIGNAL.try_take() {
-                    (gain_left, gain_right) = gain;
+                    usb_gain = gain;
                 }
 
+                // Data should arrive at least once every millisecond.
                 let result = usb_audio_receiver
                     .receive()
-                    .with_timeout(Duration::from_millis(10))
+                    .with_timeout(Duration::from_millis(2))
                     .await;
 
                 if let Ok(samples) = result {
                     let mut processed_samples = [0u32; 2 * USB_MAX_SAMPLE_COUNT];
+
+                    status_led.set_high();
                     let output_sample_count =
-                        process(samples, &mut processed_samples, &mut filters, gain_left, gain_right);
+                        process(samples, &mut processed_samples, &mut filters, usb_gain.0, usb_gain.1);
+                    status_led.set_low();
+
                     let result = sai_amp.write(&processed_samples[..output_sample_count]).await;
 
                     // Notify the channel that the buffer is now ready to be reused
@@ -274,20 +250,23 @@ pub async fn audio_routing_task(
 
                     result.is_err()
                 } else {
-                    false
+                    // FIXME: Workaround, stop streaming USB audio, when no packets arrive.
+                    USB_IS_STREAMING.store(false, Relaxed);
+                    true
                 }
             }
-            _ => {
+            AudioSource::None => {
+                sai_amp.set_mute(true);
                 Timer::after_millis(100).await;
                 false
             }
+            _ => {
+                if let Some(gain) = POT_GAIN_SIGNAL.try_take() {
+                    _pot_gain = (gain, gain);
+                }
+                false
+            }
         };
-
-        if gain_left == 0.0 && gain_right == 0.0 {
-            sai_amp.set_mute(true);
-        } else {
-            sai_amp.set_mute(false);
-        }
 
         // Renew the SAI setup in case of errors.
         if renew {
