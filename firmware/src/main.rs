@@ -10,6 +10,8 @@ use embassy_executor::Spawner;
 use embassy_stm32::adc::{self, AdcChannel};
 use embassy_stm32::gpio::{Input, Level, Output, Pull, Speed};
 use embassy_stm32::mode::Async;
+use embassy_stm32::peripherals::SPDIFRX1;
+use embassy_stm32::spdifrx::{self, Spdifrx};
 use embassy_stm32::time::Hertz;
 use embassy_stm32::{bind_interrupts, i2c, interrupt, peripherals, timer, usb};
 use embassy_sync::blocking_mutex::raw::{CriticalSectionRawMutex, NoopRawMutex};
@@ -28,6 +30,7 @@ bind_interrupts!(struct Irqs {
     OTG_HS => usb::InterruptHandler<peripherals::USB_OTG_HS>;
     I2C1_EV => i2c::EventInterruptHandler<peripherals::I2C1>;
     I2C1_ER => i2c::ErrorInterruptHandler<peripherals::I2C1>;
+    SPDIF_RX => spdifrx::GlobalInterruptHandler<peripherals::SPDIFRX1>;
 });
 
 static TIMER: Mutex<CriticalSectionRawMutex, RefCell<Option<timer::low_level::Timer<peripherals::TIM2>>>> =
@@ -50,6 +53,13 @@ struct AdcResources<T: adc::Instance> {
     adc: adc::Adc<'static, T>,
     pin: adc::AnyAdcChannel<T>,
     dma: peripherals::DMA1_CH0,
+}
+
+#[allow(unused)]
+struct SpdifResources {
+    spdifrx: peripherals::SPDIFRX1,
+    in_pin: peripherals::PD7,
+    dma: peripherals::DMA2_CH7,
 }
 
 pub fn get_filters() -> [AudioFilter<'static>; OUTPUT_CHANNEL_COUNT] {
@@ -280,6 +290,20 @@ async fn potentiometer_task(mut adc_resources: AdcResources<peripherals::ADC1>) 
     }
 }
 
+#[embassy_executor::task]
+async fn spdif_task(resources: SpdifResources) {
+    let mut dma_buf = [0u32; 512];
+    let mut spdif = Spdifrx::new(resources.spdifrx, Irqs, resources.in_pin, resources.dma, &mut dma_buf);
+
+    info!("Start S/PDIF");
+    spdif.start();
+    loop {
+        let mut data = [0u32, 256];
+        spdif.read_data(&mut data).await;
+        info!("{}", data);
+    }
+}
+
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
     info!("Hi.");
@@ -309,7 +333,7 @@ async fn main(spawner: Spawner) {
             mul: PllMul::MUL125,
             divp: Some(PllDiv::DIV2), // 192 MHz
             divq: Some(PllDiv::DIV8), // 48 MHz for USB
-            divr: Some(PllDiv::DIV2), // 192 MHz
+            divr: Some(PllDiv::DIV4), // 96 MHz for SPDIFRX
         });
         peripheral_config.rcc.sys = Sysclk::PLL1_P;
         peripheral_config.rcc.ahb_pre = AHBPrescaler::DIV2;
@@ -327,6 +351,7 @@ async fn main(spawner: Spawner) {
         peripheral_config.rcc.mux.usbsel = mux::Usbsel::PLL3_Q;
         peripheral_config.rcc.mux.sai1sel = mux::Saisel::PLL1_Q;
         peripheral_config.rcc.mux.adcsel = mux::Adcsel::PLL3_R;
+        peripheral_config.rcc.mux.spdifrxsel = mux::Spdifrxsel::PLL3_R;
     }
     let p = embassy_stm32::init(peripheral_config);
 
@@ -481,6 +506,12 @@ async fn main(spawner: Spawner) {
         dma: p.DMA1_CH0,
     };
 
+    let spdif_resources = SpdifResources {
+        spdifrx: p.SPDIFRX1,
+        in_pin: p.PD7,
+        dma: p.DMA2_CH7,
+    };
+
     // Establish a zero-copy channel for transferring received audio samples between tasks
     static SAMPLE_BLOCKS: StaticCell<[SampleBlock; 2]> = StaticCell::new();
     let sample_blocks = SAMPLE_BLOCKS.init([Vec::new(), Vec::new()]);
@@ -525,6 +556,8 @@ async fn main(spawner: Spawner) {
 
     // Amplifier setup and control.
     unwrap!(spawner.spawn(amplifier_task(amplifier_resources)));
+
+    unwrap!(spawner.spawn(spdif_task(spdif_resources)));
 }
 
 #[interrupt]

@@ -250,8 +250,6 @@ pub async fn audio_routing_task(
 
                     result.is_err()
                 } else {
-                    // FIXME: Workaround, stop streaming USB audio, when no packets arrive.
-                    USB_IS_STREAMING.store(false, Relaxed);
                     true
                 }
             }
@@ -270,8 +268,8 @@ pub async fn audio_routing_task(
 
         // Renew the SAI setup in case of errors.
         if renew {
+            info!("Renew SAI");
             SAI_ACTIVE_SIGNAL.signal(false);
-            info!("Renew SAI setup.");
 
             drop(sai_amp);
             drop(sai_rpi);
@@ -287,9 +285,9 @@ pub async fn audio_routing_task(
             sai_rpi.start();
 
             SAI_ACTIVE_SIGNAL.signal(true);
+        } else {
+            // Check, if there is a signal stream arriving from the Raspberry Pi header.
+            RPI_IS_STREAMING.store(!sai_rpi.is_muted().unwrap(), Relaxed);
         }
-
-        // Check, if there is a signal stream arriving from the Raspberry Pi header.
-        RPI_IS_STREAMING.store(!sai_rpi.is_muted().unwrap(), Relaxed);
     }
 }

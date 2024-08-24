@@ -9,6 +9,7 @@ use static_assertions;
 
 use crate::*;
 
+// Number of ticks of the feedback timer per audio sample period.
 const TICKS_PER_SAMPLE: u32 = FEEDBACK_COUNTER_TICK_RATE / SAMPLE_RATE_HZ;
 static_assertions::const_assert_eq!(TICKS_PER_SAMPLE * SAMPLE_RATE_HZ, FEEDBACK_COUNTER_TICK_RATE);
 
@@ -20,7 +21,7 @@ const FEEDBACK_SHIFT: usize = 16;
 #[cfg(not(feature = "usb_high_speed"))]
 const FEEDBACK_SHIFT: usize = 14;
 
-const FEEDBACK_FACTOR: u32 = ((1 << FEEDBACK_SHIFT) / TICKS_PER_SAMPLE) >> (FEEDBACK_REFRESH_PERIOD as usize);
+const FEEDBACK_FACTOR: u32 = ((1 << FEEDBACK_SHIFT) / TICKS_PER_SAMPLE) / FEEDBACK_REFRESH_PERIOD.frame_count() as u32;
 static_assertions::const_assert_eq!(
     (FEEDBACK_FACTOR << (FEEDBACK_REFRESH_PERIOD as usize)) * TICKS_PER_SAMPLE,
     (1 << FEEDBACK_SHIFT)
