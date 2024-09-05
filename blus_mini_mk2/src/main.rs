@@ -388,6 +388,14 @@ async fn main(spawner: Spawner) {
     }
     let p = embassy_stm32::init(peripheral_config);
 
+    let mut core_peri = cortex_m::Peripherals::take().unwrap();
+
+    // Enable instruction cache.
+    core_peri.SCB.enable_icache();
+
+    // FIXME: Enable data chache, but configure DMA MPU first.
+    // core_peri.SCB.enable_dcache(&mut core_peri.CPUID);
+
     let mut led_blue = Output::new(p.PC6, Level::Low, Speed::Low);
     let mut led_green = Output::new(p.PC7, Level::Low, Speed::Low);
     let mut led_yellow = Output::new(p.PC8, Level::Low, Speed::Low);
