@@ -3,6 +3,7 @@
 
 use core::cell::RefCell;
 
+use audio::{self, AudioFilter};
 use blus_fw::*;
 use defmt::{debug, info, unwrap};
 use embassy_embedded_hal::shared_bus::blocking::i2c::I2cDevice;
@@ -10,7 +11,6 @@ use embassy_executor::Spawner;
 use embassy_stm32::adc::{self, AdcChannel};
 use embassy_stm32::gpio::{Input, Level, Output, Pull, Speed};
 use embassy_stm32::mode::Async;
-use embassy_stm32::peripherals::SPDIFRX1;
 use embassy_stm32::spdifrx::{self, Spdifrx};
 use embassy_stm32::time::Hertz;
 use embassy_stm32::{bind_interrupts, i2c, interrupt, peripherals, timer, usb};
@@ -40,6 +40,9 @@ static I2C_BUS: StaticCell<NoopMutex<RefCell<i2c::I2c<'static, Async>>>> = Stati
 // Accessible by most system masters (Zone D2)
 #[link_section = ".sram1"]
 static mut ADC1_MEASUREMENT_BUFFER: GroundedArrayCell<u16, 1> = GroundedArrayCell::uninit();
+
+#[link_section = ".sram1"]
+static mut SPDIFRX_BUFFER: GroundedArrayCell<u32, SPDIF_SAMPLE_COUNT> = GroundedArrayCell::uninit();
 
 #[allow(unused)]
 struct AmplifierResources {
@@ -153,7 +156,7 @@ pub fn get_filters() -> [AudioFilter<'static>; OUTPUT_CHANNEL_COUNT] {
 
 #[embassy_executor::task]
 async fn amplifier_task(amplifier_resources: AmplifierResources) {
-    use blus_fw::tas2780::*;
+    use audio::tas2780::*;
 
     let mut pin_nsd = amplifier_resources.pin_nsd;
 
@@ -291,16 +294,46 @@ async fn potentiometer_task(mut adc_resources: AdcResources<peripherals::ADC1>) 
 }
 
 #[embassy_executor::task]
-async fn spdif_task(resources: SpdifResources) {
-    let mut dma_buf = [0u32; 512];
-    let mut spdif = Spdifrx::new(resources.spdifrx, Irqs, resources.in_pin, resources.dma, &mut dma_buf);
+async fn spdif_task(
+    mut resources: SpdifResources,
+    mut sender: zerocopy_channel::Sender<'static, NoopRawMutex, SpdifSampleBlock>,
+) {
+    let buffer: &mut [u32] = unsafe {
+        SPDIFRX_BUFFER.initialize_all_copied(0);
+        let (ptr, len) = SPDIFRX_BUFFER.get_ptr_len();
+        core::slice::from_raw_parts_mut(ptr, len)
+    };
+
+    let mut spdif = Spdifrx::new_data_only(
+        &mut resources.spdifrx,
+        Irqs,
+        spdifrx::Config::default(),
+        &mut resources.in_pin,
+        &mut resources.dma,
+        buffer,
+    );
 
     info!("Start S/PDIF");
     spdif.start();
     loop {
-        let mut data = [0u32, 256];
-        spdif.read_data(&mut data).await;
-        info!("{}", data);
+        let data = sender.send().await;
+
+        let result = spdif.read_data(data).await;
+
+        if result.is_err() {
+            drop(spdif);
+            spdif = Spdifrx::new_data_only(
+                &mut resources.spdifrx,
+                Irqs,
+                spdifrx::Config::default(),
+                &mut resources.in_pin,
+                &mut resources.dma,
+                buffer,
+            );
+            spdif.start();
+        }
+
+        sender.send_done();
     }
 }
 
@@ -333,7 +366,7 @@ async fn main(spawner: Spawner) {
             mul: PllMul::MUL125,
             divp: Some(PllDiv::DIV2), // 192 MHz
             divq: Some(PllDiv::DIV8), // 48 MHz for USB
-            divr: Some(PllDiv::DIV4), // 96 MHz for SPDIFRX
+            divr: Some(PllDiv::DIV4), // 96 MHz for SPDIFRX (good for up to 136 kHz audio sample rate)
         });
         peripheral_config.rcc.sys = Sysclk::PLL1_P;
         peripheral_config.rcc.ahb_pre = AHBPrescaler::DIV2;
@@ -512,13 +545,23 @@ async fn main(spawner: Spawner) {
         dma: p.DMA2_CH7,
     };
 
-    // Establish a zero-copy channel for transferring received audio samples between tasks
-    static SAMPLE_BLOCKS: StaticCell<[SampleBlock; 2]> = StaticCell::new();
-    let sample_blocks = SAMPLE_BLOCKS.init([Vec::new(), Vec::new()]);
+    // FIXME: deduplicate
 
-    static CHANNEL: StaticCell<zerocopy_channel::Channel<'_, NoopRawMutex, SampleBlock>> = StaticCell::new();
-    let channel = CHANNEL.init(zerocopy_channel::Channel::new(sample_blocks));
-    let (sender, receiver) = channel.split();
+    // Establish a zero-copy channel for transferring received audio samples from the USB audio task.
+    static USB_SAMPLE_BLOCKS: StaticCell<[UsbSampleBlock; 2]> = StaticCell::new();
+    let usb_sample_blocks = USB_SAMPLE_BLOCKS.init([Vec::new(), Vec::new()]);
+
+    static USB_CHANNEL: StaticCell<zerocopy_channel::Channel<'_, NoopRawMutex, UsbSampleBlock>> = StaticCell::new();
+    let usb_channel = USB_CHANNEL.init(zerocopy_channel::Channel::new(usb_sample_blocks));
+    let (usb_sender, usb_receiver) = usb_channel.split();
+
+    // Establish a zero-copy channel for transferring received audio samples from the S/PDIF task.
+    static SPDIF_SAMPLE_BLOCKS: StaticCell<[SpdifSampleBlock; 2]> = StaticCell::new();
+    let spdif_sample_blocks = SPDIF_SAMPLE_BLOCKS.init([[0u32; SPDIF_SAMPLE_COUNT]; 2]);
+
+    static SPDIF_CHANNEL: StaticCell<zerocopy_channel::Channel<'_, NoopRawMutex, SpdifSampleBlock>> = StaticCell::new();
+    let spdif_channel = SPDIF_CHANNEL.init(zerocopy_channel::Channel::new(spdif_sample_blocks));
+    let (spdif_sender, spdif_receiver) = spdif_channel.split();
 
     // Trigger on USB SOF (internal signal)
     let mut tim2 = timer::low_level::Timer::new(p.TIM2);
@@ -536,7 +579,7 @@ async fn main(spawner: Spawner) {
 
     // Launch USB audio tasks.
     unwrap!(spawner.spawn(usb_audio::control_task(control_changed)));
-    unwrap!(spawner.spawn(usb_audio::streaming_task(stream, sender)));
+    unwrap!(spawner.spawn(usb_audio::streaming_task(stream, usb_sender)));
     unwrap!(spawner.spawn(usb_audio::feedback_task(feedback)));
     unwrap!(spawner.spawn(usb_audio::usb_task(usb_device)));
 
@@ -544,7 +587,8 @@ async fn main(spawner: Spawner) {
     unwrap!(spawner.spawn(audio_routing::audio_routing_task(
         get_filters(),
         sai4_resources,
-        receiver,
+        usb_receiver,
+        spdif_receiver,
         led_blue,
         led_red,
         led_yellow,
@@ -557,7 +601,7 @@ async fn main(spawner: Spawner) {
     // Amplifier setup and control.
     unwrap!(spawner.spawn(amplifier_task(amplifier_resources)));
 
-    unwrap!(spawner.spawn(spdif_task(spdif_resources)));
+    unwrap!(spawner.spawn(spdif_task(spdif_resources, spdif_sender)));
 }
 
 #[interrupt]

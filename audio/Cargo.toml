@@ -1,0 +1,16 @@
+[package]
+name = "audio"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+biquad = { version = "0.4.2" }
+micromath = "2.0.0"
+defmt = "0.3"
+
+embassy-time = { path = "../embassy/embassy-time", features = [
+    "defmt",
+    "defmt-timestamp-uptime",
+] }
+
+embedded-hal-1 = { package = "embedded-hal", version = "1.0" }

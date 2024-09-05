@@ -1,3 +1,7 @@
 {
-    "rust-analyzer.cargo.targetDir": "firmware"
+    // Comment out the project to analyze.
+    "rust-analyzer.linkedProjects": [
+        // "blus_mini_mk1/Cargo.toml",
+        "blus_mini_mk2/Cargo.toml",
+    ]
 }

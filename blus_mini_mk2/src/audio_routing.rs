@@ -1,10 +1,11 @@
+use audio::{audio_filter, AudioFilter};
 use core::sync::atomic::Ordering::Relaxed;
 use defmt::{info, panic};
 use embassy_stm32::gpio::Output;
 use embassy_stm32::{peripherals, sai};
 use embassy_sync::blocking_mutex::raw::NoopRawMutex;
 use embassy_sync::zerocopy_channel;
-use embassy_time::{Duration, Timer, WithTimeout};
+use embassy_time::{Duration, Timer, WithTimeout as _};
 use grounded::uninit::GroundedArrayCell;
 use static_assertions;
 
@@ -13,7 +14,7 @@ use crate::*;
 // Factor of two for being able to buffer two full USB packets (excessive)
 const SAI_AMP_SAMPLE_COUNT: usize = 2 * USB_MAX_SAMPLE_COUNT;
 
-// Buffer of around 10 ms size
+// Buffer of around 1 ms size
 const SAI_RPI_SAMPLE_COUNT: usize = SAMPLE_SIZE_PER_S.div_ceil(1000) / SAMPLE_SIZE;
 
 // Do not exceed the write buffer (after processing) with samples from the Raspberry Pi.
@@ -63,10 +64,20 @@ fn new_sai4<'d>(
     sai4a_write_buffer: &'d mut [u32],
     sai4b_read_buffer: &'d mut [u32],
     sample_rate_hz: u32,
+    audio_source: AudioSource,
 ) -> (
     sai::Sai<'d, peripherals::SAI4, u32>,
     sai::Sai<'d, peripherals::SAI4, u32>,
 ) {
+    let clk_source = match audio_source {
+        AudioSource::Spdif => embassy_stm32::pac::rcc::vals::Saiasel::_RESERVED_5,
+        _ => embassy_stm32::pac::rcc::vals::Saiasel::PLL1_Q,
+    };
+
+    embassy_stm32::pac::RCC.d3ccipr().modify(|w| {
+        w.set_sai4asel(clk_source);
+    });
+
     let (sai4_a, sai4_b) = sai::split_subblocks(&mut resources.sai);
 
     let sai4_a_driver = {
@@ -74,15 +85,27 @@ fn new_sai4<'d>(
 
         config.slot_count = sai::word::U4(OUTPUT_CHANNEL_COUNT as u8);
         config.slot_enable = 0xFFFF; // All slots
-        config.data_size = sai::DataSize::Data32;
         config.frame_sync_definition = sai::FrameSyncDefinition::StartOfFrame;
-        config.frame_length = (OUTPUT_CHANNEL_COUNT * SAMPLE_WIDTH_BIT) as u8;
         config.bit_order = sai::BitOrder::MsbFirst;
 
-        match sample_rate_hz {
-            SAMPLE_RATE_HZ => config.master_clock_divider = sai::MasterClockDivider::Div2,
-            _ => panic!("Unsupported SAI sample rate."),
-        }
+        match audio_source {
+            AudioSource::Spdif => {
+                config.slot_count = sai::word::U4(INPUT_CHANNEL_COUNT as u8);
+                config.data_size = sai::DataSize::Data32;
+                config.frame_length = (INPUT_CHANNEL_COUNT * SAMPLE_WIDTH_BIT) as u8;
+
+                config.master_clock_divider = sai::MasterClockDivider::MasterClockDisabled;
+            }
+            _ => {
+                config.data_size = sai::DataSize::Data32;
+                config.frame_length = (OUTPUT_CHANNEL_COUNT * SAMPLE_WIDTH_BIT) as u8;
+
+                match sample_rate_hz {
+                    SAMPLE_RATE_HZ => config.master_clock_divider = sai::MasterClockDivider::Div2,
+                    _ => panic!("Unsupported SAI sample rate."),
+                }
+            }
+        };
 
         sai::Sai::new_asynchronous(
             sai4_a,
@@ -154,11 +177,12 @@ fn process(
 pub async fn audio_routing_task(
     mut filters: [AudioFilter<'static>; OUTPUT_CHANNEL_COUNT],
     mut sai4_resources: Sai4Resources,
-    mut usb_audio_receiver: zerocopy_channel::Receiver<'static, NoopRawMutex, SampleBlock>,
+    mut usb_audio_receiver: zerocopy_channel::Receiver<'static, NoopRawMutex, UsbSampleBlock>,
+    mut spdif_audio_receiver: zerocopy_channel::Receiver<'static, NoopRawMutex, SpdifSampleBlock>,
     mut status_led: Output<'static>,
     mut led_usb: Output<'static>,
     mut led_rpi: Output<'static>,
-    mut led_ext: Output<'static>,
+    mut led_spdif: Output<'static>,
 ) {
     info!("Amplifier SAI write buffer size: {} samples", SAI_AMP_SAMPLE_COUNT);
     info!("Raspberry Pi SAI read buffer size: {} samples", SAI_RPI_SAMPLE_COUNT);
@@ -180,6 +204,7 @@ pub async fn audio_routing_task(
         sai_amp_write_buffer,
         sai_rpi_read_buffer,
         SAMPLE_RATE_HZ,
+        AudioSource::None,
     );
 
     let mut usb_gain = (0.0, 0.0);
@@ -192,12 +217,12 @@ pub async fn audio_routing_task(
 
     loop {
         // Update the audio source.
-        for led in [&mut led_usb, &mut led_rpi, &mut led_ext] {
+        for led in [&mut led_usb, &mut led_rpi, &mut led_spdif] {
             led.set_low();
         }
 
         // Source prioritization is determined by the order of checks.
-        let source = if RPI_IS_STREAMING.load(Relaxed) {
+        let audio_source = if RPI_IS_STREAMING.load(Relaxed) {
             led_rpi.set_high();
             AudioSource::RaspberryPi
         } else if USB_IS_STREAMING.load(Relaxed) {
@@ -207,7 +232,7 @@ pub async fn audio_routing_task(
             AudioSource::None
         };
 
-        let renew = match source {
+        let renew = match audio_source {
             AudioSource::RaspberryPi => {
                 let result = sai_rpi.read(&mut rpi_samples).await;
 
@@ -258,6 +283,35 @@ pub async fn audio_routing_task(
                 Timer::after_millis(100).await;
                 false
             }
+            AudioSource::Spdif => {
+                // Data should arrive once every millisecond.
+                let result = spdif_audio_receiver
+                    .receive()
+                    .with_timeout(Duration::from_millis(2))
+                    .await;
+
+                if let Ok(samples) = result {
+                    let mut processed_samples = [0u32; 2 * SPDIF_SAMPLE_COUNT];
+
+                    status_led.set_high();
+                    let output_sample_count = process(samples, &mut processed_samples, &mut filters, 1.0, 1.0);
+                    status_led.set_low();
+
+                    for i in 0..output_sample_count / 4 {
+                        processed_samples[2 * i] = processed_samples[4 * i];
+                        processed_samples[2 * i + 1] = processed_samples[4 * i + 1];
+                    }
+
+                    let result = sai_amp.write(&processed_samples[..output_sample_count / 2]).await;
+
+                    // Notify the channel that the buffer is now ready to be reused
+                    spdif_audio_receiver.receive_done();
+
+                    result.is_err()
+                } else {
+                    true
+                }
+            }
             _ => {
                 if let Some(gain) = POT_GAIN_SIGNAL.try_take() {
                     _pot_gain = (gain, gain);
@@ -279,6 +333,7 @@ pub async fn audio_routing_task(
                 sai_amp_write_buffer,
                 sai_rpi_read_buffer,
                 SAMPLE_RATE_HZ,
+                audio_source,
             );
 
             sai_amp.start();

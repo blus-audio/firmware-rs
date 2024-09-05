@@ -1,5 +1,5 @@
 use core::sync::atomic::Ordering::Relaxed;
-use defmt::{debug, panic};
+use defmt::{debug, info, panic};
 use embassy_stm32::{peripherals, usb};
 use embassy_sync::blocking_mutex::raw::NoopRawMutex;
 use embassy_sync::zerocopy_channel;
@@ -13,12 +13,7 @@ use crate::*;
 const TICKS_PER_SAMPLE: u32 = FEEDBACK_COUNTER_TICK_RATE / SAMPLE_RATE_HZ;
 static_assertions::const_assert_eq!(TICKS_PER_SAMPLE * SAMPLE_RATE_HZ, FEEDBACK_COUNTER_TICK_RATE);
 
-// Feedback is provided in 16.16 format for high-speed endpoints.
-#[cfg(feature = "usb_high_speed")]
-const FEEDBACK_SHIFT: usize = 16;
-
 // Feedback is provided in 10.14 format for full-speed endpoints.
-#[cfg(not(feature = "usb_high_speed"))]
 const FEEDBACK_SHIFT: usize = 14;
 
 const FEEDBACK_FACTOR: u32 = ((1 << FEEDBACK_SHIFT) / TICKS_PER_SAMPLE) / FEEDBACK_REFRESH_PERIOD.frame_count() as u32;
@@ -45,25 +40,15 @@ async fn feedback_handler<'d, T: usb::Instance + 'd>(
 
     loop {
         let counter = FEEDBACK_SIGNAL.wait().await;
+        info!("{}", counter);
 
         packet.clear();
 
         let value = counter * FEEDBACK_FACTOR;
 
-        #[cfg(feature = "usb_high_speed")]
-        {
-            packet.push(value as u8).unwrap();
-            packet.push((value >> 8) as u8).unwrap();
-            packet.push((value >> 16) as u8).unwrap();
-            packet.push((value >> 24) as u8).unwrap();
-        }
-
-        #[cfg(not(feature = "usb_high_speed"))]
-        {
-            packet.push(value as u8).unwrap();
-            packet.push((value >> 8) as u8).unwrap();
-            packet.push((value >> 16) as u8).unwrap();
-        }
+        packet.push(value as u8).unwrap();
+        packet.push((value >> 8) as u8).unwrap();
+        packet.push((value >> 16) as u8).unwrap();
 
         feedback.write_packet(&packet).await?;
     }
@@ -71,7 +56,7 @@ async fn feedback_handler<'d, T: usb::Instance + 'd>(
 
 async fn stream_handler<'d, T: usb::Instance + 'd>(
     stream: &mut speaker::Stream<'d, usb::Driver<'d, T>>,
-    sender: &mut zerocopy_channel::Sender<'static, NoopRawMutex, SampleBlock>,
+    sender: &mut zerocopy_channel::Sender<'static, NoopRawMutex, UsbSampleBlock>,
 ) -> Result<(), Disconnected> {
     loop {
         let mut usb_data = [0u8; USB_MAX_PACKET_SIZE];
@@ -89,7 +74,8 @@ async fn stream_handler<'d, T: usb::Instance + 'd>(
                 let sample = u32::from_le_bytes(usb_data[byte_offset..byte_offset + SAMPLE_SIZE].try_into().unwrap());
 
                 // Fill the sample buffer with data.
-                samples.push(sample).unwrap();
+                samples.push(sample as u16).unwrap();
+                samples.push((sample >> 16) as u16).unwrap();
             }
 
             sender.send_done();
@@ -101,8 +87,8 @@ async fn stream_handler<'d, T: usb::Instance + 'd>(
 
 #[embassy_executor::task]
 pub async fn streaming_task(
-    mut stream: speaker::Stream<'static, usb::Driver<'static, peripherals::USB_OTG_HS>>,
-    mut sender: zerocopy_channel::Sender<'static, NoopRawMutex, SampleBlock>,
+    mut stream: speaker::Stream<'static, usb::Driver<'static, peripherals::USB_OTG_FS>>,
+    mut sender: zerocopy_channel::Sender<'static, NoopRawMutex, UsbSampleBlock>,
 ) {
     loop {
         stream.wait_connection().await;
@@ -113,7 +99,7 @@ pub async fn streaming_task(
 }
 
 #[embassy_executor::task]
-pub async fn feedback_task(mut feedback: speaker::Feedback<'static, usb::Driver<'static, peripherals::USB_OTG_HS>>) {
+pub async fn feedback_task(mut feedback: speaker::Feedback<'static, usb::Driver<'static, peripherals::USB_OTG_FS>>) {
     loop {
         feedback.wait_connection().await;
         _ = feedback_handler(&mut feedback).await;
@@ -121,7 +107,7 @@ pub async fn feedback_task(mut feedback: speaker::Feedback<'static, usb::Driver<
 }
 
 #[embassy_executor::task]
-pub async fn usb_task(mut usb_device: embassy_usb::UsbDevice<'static, usb::Driver<'static, peripherals::USB_OTG_HS>>) {
+pub async fn usb_task(mut usb_device: embassy_usb::UsbDevice<'static, usb::Driver<'static, peripherals::USB_OTG_FS>>) {
     usb_device.run().await;
 }
 
@@ -130,34 +116,23 @@ pub async fn control_task(control_monitor: speaker::ControlMonitor<'static>) {
     loop {
         control_monitor.changed().await;
 
-        let mut usb_gain_left = 0.0_f32;
-        let mut usb_gain_right = 0.0_f32;
+        let mut volume_left = Volume::Muted;
+        let mut volume_right = Volume::Muted;
 
         for channel in AUDIO_CHANNELS {
             let volume = control_monitor.volume(channel).unwrap();
 
-            let gain = match volume {
-                speaker::Volume::Muted => 0.0,
-                speaker::Volume::DeciBel(volume_db) => {
-                    if volume_db > 0.0 {
-                        panic!("Volume must not be positive.")
-                    }
-
-                    db_to_linear(volume_db)
-                }
-            };
-
             match channel {
                 uac1::Channel::LeftFront => {
-                    usb_gain_left = gain;
+                    volume_left = volume;
                 }
                 uac1::Channel::RightFront => {
-                    usb_gain_right = gain;
+                    volume_right = volume;
                 }
                 _ => (),
             }
         }
 
-        USB_GAIN_SIGNAL.signal((usb_gain_left, usb_gain_right));
+        VOLUME_SIGNAL.signal((volume_left, volume_right));
     }
 }
