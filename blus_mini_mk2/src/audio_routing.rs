@@ -257,7 +257,7 @@ pub async fn audio_routing_task(
                 // Data should arrive at least once every millisecond.
                 let result = usb_audio_receiver
                     .receive()
-                    .with_timeout(Duration::from_millis(2))
+                    .with_timeout(Duration::from_millis(5))
                     .await;
 
                 if let Ok(samples) = result {
@@ -275,6 +275,7 @@ pub async fn audio_routing_task(
 
                     result.is_err()
                 } else {
+                    USB_IS_STREAMING.store(false, Relaxed);
                     true
                 }
             }
@@ -287,7 +288,7 @@ pub async fn audio_routing_task(
                 // Data should arrive once every millisecond.
                 let result = spdif_audio_receiver
                     .receive()
-                    .with_timeout(Duration::from_millis(2))
+                    .with_timeout(Duration::from_millis(5))
                     .await;
 
                 if let Ok(samples) = result {

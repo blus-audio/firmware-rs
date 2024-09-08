@@ -76,6 +76,7 @@ async fn stream_handler<'d, T: usb::Instance + 'd>(
     loop {
         let mut usb_data = [0u8; USB_MAX_PACKET_SIZE];
         let data_size = stream.read_packet(&mut usb_data).await?;
+        USB_IS_STREAMING.store(true, Relaxed);
 
         let word_count = data_size / SAMPLE_SIZE;
 
@@ -106,7 +107,6 @@ pub async fn streaming_task(
 ) {
     loop {
         stream.wait_connection().await;
-        USB_IS_STREAMING.store(true, Relaxed);
         _ = stream_handler(&mut stream, &mut sender).await;
         USB_IS_STREAMING.store(false, Relaxed);
     }
