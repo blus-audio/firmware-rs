@@ -59,10 +59,10 @@ static mut SAI_AMP_WRITE_BUFFER: GroundedArrayCell<u32, SAI_AMP_SAMPLE_COUNT> = 
 #[link_section = ".sram4"]
 static mut SAI_RPI_READ_BUFFER: GroundedArrayCell<u32, SAI_RPI_SAMPLE_COUNT> = GroundedArrayCell::uninit();
 
-fn new_sai4<'d>(
+fn new_sai_amp_rpi<'d>(
     resources: &'d mut Sai4Resources,
-    sai4a_write_buffer: &'d mut [u32],
-    sai4b_read_buffer: &'d mut [u32],
+    sai_amp_write_buffer: &'d mut [u32],
+    sai_rpi_read_buffer: &'d mut [u32],
     sample_rate_hz: u32,
     audio_source: AudioSource,
 ) -> (
@@ -78,9 +78,9 @@ fn new_sai4<'d>(
         w.set_sai4asel(clk_source);
     });
 
-    let (sai4_a, sai4_b) = sai::split_subblocks(&mut resources.sai);
+    let (sai_amp, sai_rpi) = sai::split_subblocks(&mut resources.sai);
 
-    let sai4_a_driver = {
+    let sai_amp_driver = {
         let mut config = sai::Config::default();
 
         config.slot_count = sai::word::U4(OUTPUT_CHANNEL_COUNT as u8);
@@ -90,15 +90,15 @@ fn new_sai4<'d>(
 
         match audio_source {
             AudioSource::Spdif => {
-                config.slot_count = sai::word::U4(INPUT_CHANNEL_COUNT as u8);
-                config.data_size = sai::DataSize::Data32;
-                config.frame_length = (INPUT_CHANNEL_COUNT * SAMPLE_WIDTH_BIT) as u8;
+                config.data_size = sai::DataSize::Data16;
+                config.frame_length = (OUTPUT_CHANNEL_COUNT * 16) as u8;
 
                 config.master_clock_divider = sai::MasterClockDivider::MasterClockDisabled;
             }
             _ => {
+                assert_eq!(SAMPLE_WIDTH_BIT, 32);
                 config.data_size = sai::DataSize::Data32;
-                config.frame_length = (OUTPUT_CHANNEL_COUNT * SAMPLE_WIDTH_BIT) as u8;
+                config.frame_length = (OUTPUT_CHANNEL_COUNT * 32) as u8;
 
                 match sample_rate_hz {
                     SAMPLE_RATE_HZ => config.master_clock_divider = sai::MasterClockDivider::Div2,
@@ -108,17 +108,17 @@ fn new_sai4<'d>(
         };
 
         sai::Sai::new_asynchronous(
-            sai4_a,
+            sai_amp,
             &mut resources.sck_a,
             &mut resources.sd_a,
             &mut resources.fs_a,
             &mut resources.dma_a,
-            sai4a_write_buffer,
+            sai_amp_write_buffer,
             config,
         )
     };
 
-    let sai4_b_driver = {
+    let sai_rpi_driver = {
         let mut config = sai::Config::default();
         const CHANNEL_COUNT: usize = INPUT_CHANNEL_COUNT;
 
@@ -129,6 +129,7 @@ fn new_sai4<'d>(
         config.frame_length = (CHANNEL_COUNT * SAMPLE_WIDTH_BIT) as u8;
         config.frame_sync_active_level_length = sai::word::U7(SAMPLE_WIDTH_BIT as u8);
         config.bit_order = sai::BitOrder::MsbFirst;
+        config.mute_value = sai::MuteValue::LastValue;
 
         match sample_rate_hz {
             SAMPLE_RATE_HZ => config.master_clock_divider = sai::MasterClockDivider::Div2,
@@ -136,17 +137,17 @@ fn new_sai4<'d>(
         }
 
         sai::Sai::new_asynchronous(
-            sai4_b,
+            sai_rpi,
             &mut resources.sck_b,
             &mut resources.sd_b,
             &mut resources.fs_b,
             &mut resources.dma_b,
-            sai4b_read_buffer,
+            sai_rpi_read_buffer,
             config,
         )
     };
 
-    (sai4_a_driver, sai4_b_driver)
+    (sai_amp_driver, sai_rpi_driver)
 }
 
 fn process(
@@ -199,7 +200,7 @@ pub async fn audio_routing_task(
         core::slice::from_raw_parts_mut(ptr, len)
     };
 
-    let (mut sai_amp, mut sai_rpi) = new_sai4(
+    let (mut sai_amp, mut sai_rpi) = new_sai_amp_rpi(
         &mut sai4_resources,
         sai_amp_write_buffer,
         sai_rpi_read_buffer,
@@ -208,7 +209,7 @@ pub async fn audio_routing_task(
     );
 
     let mut usb_gain = (0.0, 0.0);
-    let mut _pot_gain = (0.0, 0.0);
+    let mut pot_gain = (0.0, 0.0);
 
     let mut rpi_samples = [0u32; SAI_RPI_SAMPLE_COUNT];
 
@@ -285,6 +286,10 @@ pub async fn audio_routing_task(
                 false
             }
             AudioSource::Spdif => {
+                if let Some(gain) = POT_GAIN_SIGNAL.try_take() {
+                    pot_gain = (gain, gain);
+                }
+
                 // Data should arrive once every millisecond.
                 let result = spdif_audio_receiver
                     .receive()
@@ -295,15 +300,16 @@ pub async fn audio_routing_task(
                     let mut processed_samples = [0u32; 2 * SPDIF_SAMPLE_COUNT];
 
                     status_led.set_high();
-                    let output_sample_count = process(samples, &mut processed_samples, &mut filters, 1.0, 1.0);
+                    let output_sample_count =
+                        process(samples, &mut processed_samples, &mut filters, pot_gain.0, pot_gain.1);
+
+                    // FIXME: Explanation? 16 bit playback in 32 bit DMA mode.
+                    for sample in processed_samples.iter_mut() {
+                        *sample >>= 16;
+                    }
                     status_led.set_low();
 
-                    for i in 0..output_sample_count / 4 {
-                        processed_samples[2 * i] = processed_samples[4 * i];
-                        processed_samples[2 * i + 1] = processed_samples[4 * i + 1];
-                    }
-
-                    let result = sai_amp.write(&processed_samples[..output_sample_count / 2]).await;
+                    let result = sai_amp.write(&processed_samples[..output_sample_count]).await;
 
                     // Notify the channel that the buffer is now ready to be reused
                     spdif_audio_receiver.receive_done();
@@ -313,23 +319,20 @@ pub async fn audio_routing_task(
                     true
                 }
             }
-            _ => {
-                if let Some(gain) = POT_GAIN_SIGNAL.try_take() {
-                    _pot_gain = (gain, gain);
-                }
-                false
-            }
+            _ => false,
         };
 
         // Renew the SAI setup in case of errors.
         if renew {
             info!("Renew SAI");
-            SAI_ACTIVE_SIGNAL.signal(false);
 
             drop(sai_amp);
             drop(sai_rpi);
 
-            (sai_amp, sai_rpi) = new_sai4(
+            SAI_ACTIVE_SIGNAL.signal(audio_source);
+            AMP_SETUP_SIGNAL.wait().await;
+
+            (sai_amp, sai_rpi) = new_sai_amp_rpi(
                 &mut sai4_resources,
                 sai_amp_write_buffer,
                 sai_rpi_read_buffer,
@@ -339,8 +342,6 @@ pub async fn audio_routing_task(
 
             sai_amp.start();
             sai_rpi.start();
-
-            SAI_ACTIVE_SIGNAL.signal(true);
         } else {
             // Check, if there is a signal stream arriving from the Raspberry Pi header.
             RPI_IS_STREAMING.store(!sai_rpi.is_muted().unwrap(), Relaxed);

@@ -166,6 +166,11 @@ async fn main(spawner: Spawner) {
     }
     let p = embassy_stm32::init(peripheral_config);
 
+    let mut core_peri = cortex_m::Peripherals::take().unwrap();
+
+    // Enable instruction cache.
+    core_peri.SCB.enable_icache();
+
     debug!("USB packet size is {} byte", USB_MAX_PACKET_SIZE);
     static CONFIG_DESCRIPTOR: StaticCell<[u8; 256]> = StaticCell::new();
     let config_descriptor = CONFIG_DESCRIPTOR.init([0; 256]);
@@ -188,8 +193,7 @@ async fn main(spawner: Spawner) {
     // Create the driver, from the HAL.
     let mut usb_config = usb::Config::default();
 
-    // Do not enable vbus_detection with an external HS PHY.
-    usb_config.vbus_detection = false;
+    usb_config.vbus_detection = true;
 
     // Initialize driver for high-speed external PHY.
     let usb_driver = usb::Driver::new_fs(p.USB_OTG_FS, Irqs, p.PA12, p.PA11, ep_out_buffer, usb_config);
@@ -239,7 +243,7 @@ async fn main(spawner: Spawner) {
             Irqs,
             p.DMA1_CH6,
             p.DMA1_CH0,
-            Hertz(1_000_000),
+            Hertz(100_000),
             Default::default(),
         ),
         pin_nsd: Output::new(p.PC13, Level::Low, Speed::Low),
@@ -264,18 +268,18 @@ async fn main(spawner: Spawner) {
     let (usb_sender, usb_receiver) = usb_channel.split();
 
     // Trigger on USB SOF (internal signal)
-    // let mut tim2 = timer::low_level::Timer::new(p.TIM2);
-    // tim2.set_tick_freq(Hertz(FEEDBACK_COUNTER_TICK_RATE));
-    // tim2.set_trigger_source(timer::low_level::TriggerSource::ITR1);
-    // tim2.set_slave_mode(timer::low_level::SlaveMode::TRIGGER_MODE);
-    // tim2.regs_gp16().dier().modify(|r| r.set_tie(true));
-    // tim2.start();
+    let mut tim2 = timer::low_level::Timer::new(p.TIM2);
+    tim2.set_tick_freq(Hertz(FEEDBACK_COUNTER_TICK_RATE));
+    tim2.set_trigger_source(timer::low_level::TriggerSource::ITR1);
+    tim2.set_slave_mode(timer::low_level::SlaveMode::TRIGGER_MODE);
+    tim2.regs_gp16().dier().modify(|r| r.set_tie(true));
+    tim2.start();
 
-    // TIMER.lock(|p| p.borrow_mut().replace(tim2));
+    TIMER.lock(|p| p.borrow_mut().replace(tim2));
 
-    // unsafe {
-    //     cortex_m::peripheral::NVIC::unmask(interrupt::TIM2);
-    // }
+    unsafe {
+        cortex_m::peripheral::NVIC::unmask(interrupt::TIM2);
+    }
 
     // Launch USB audio tasks.
     unwrap!(spawner.spawn(usb_audio::control_task(control_changed)));
@@ -284,7 +288,7 @@ async fn main(spawner: Spawner) {
     unwrap!(spawner.spawn(usb_audio::usb_task(usb_device)));
 
     // Launch audio routing.
-    // unwrap!(spawner.spawn(audio_routing::audio_routing_task(i2s_resources, usb_receiver)));
+    unwrap!(spawner.spawn(audio_routing::audio_routing_task(i2s_resources, usb_receiver)));
 
     // Amplifier setup and control.
     // unwrap!(spawner.spawn(amplifier_task(amplifier_resources)));

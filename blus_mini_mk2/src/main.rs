@@ -3,7 +3,7 @@
 
 use core::cell::RefCell;
 
-use audio::{self, AudioFilter};
+use audio::{self, AudioFilter, AudioSource};
 use blus_fw::*;
 use defmt::{debug, info, unwrap};
 use embassy_embedded_hal::shared_bus::blocking::i2c::I2cDevice;
@@ -163,57 +163,17 @@ async fn amplifier_task(amplifier_resources: AmplifierResources) {
     let i2c_bus = NoopMutex::new(RefCell::new(amplifier_resources.i2c));
     let i2c_bus = I2C_BUS.init(i2c_bus);
 
-    const NOISE_GATE: Option<NoiseGate> = Some(NoiseGate {
-        hysteresis: NoiseGateHysteresis::Duration1000ms,
-        level: NoiseGateLevel::ThresholdMinus90dBFS,
-    });
-
-    const POWER_MODE: PowerMode = PowerMode::Two;
-    const AMPLIFIER_LEVEL: Gain = Gain::Gain11_0dBV;
-
     let mut ic2_device_a = I2cDevice::new(i2c_bus);
-    let mut tas2780_a = Tas2780::new(
-        &mut ic2_device_a,
-        0x39,
-        0,
-        Channel::Left,
-        AMPLIFIER_LEVEL,
-        POWER_MODE,
-        NOISE_GATE,
-    );
+    let mut tas2780_a = Tas2780::new(&mut ic2_device_a, 0x39);
 
     let mut ic2_device_b = I2cDevice::new(i2c_bus);
-    let mut tas2780_b = Tas2780::new(
-        &mut ic2_device_b,
-        0x3a,
-        1,
-        Channel::Left,
-        AMPLIFIER_LEVEL,
-        POWER_MODE,
-        NOISE_GATE,
-    );
+    let mut tas2780_b = Tas2780::new(&mut ic2_device_b, 0x3a);
 
     let mut ic2_device_c = I2cDevice::new(i2c_bus);
-    let mut tas2780_c = Tas2780::new(
-        &mut ic2_device_c,
-        0x3d,
-        2,
-        Channel::Right,
-        AMPLIFIER_LEVEL,
-        POWER_MODE,
-        NOISE_GATE,
-    );
+    let mut tas2780_c = Tas2780::new(&mut ic2_device_c, 0x3d);
 
     let mut ic2_device_d = I2cDevice::new(i2c_bus);
-    let mut tas2780_d = Tas2780::new(
-        &mut ic2_device_d,
-        0x3e,
-        3,
-        Channel::Right,
-        AMPLIFIER_LEVEL,
-        POWER_MODE,
-        NOISE_GATE,
-    );
+    let mut tas2780_d = Tas2780::new(&mut ic2_device_d, 0x3e);
 
     debug!("Reset amplifiers.");
     pin_nsd.set_low();
@@ -223,20 +183,58 @@ async fn amplifier_task(amplifier_resources: AmplifierResources) {
     // Wait for reset
     Timer::after_millis(10).await;
 
-    debug!("Initialize TAS2780");
-    for amplifier in [&mut tas2780_a, &mut tas2780_b, &mut tas2780_c, &mut tas2780_d] {
-        amplifier.init().await;
-    }
+    tas2780_a
+        .init(Config {
+            tdm_slot: 0,
+            ..Default::default()
+        })
+        .await;
+    tas2780_b
+        .init(Config {
+            tdm_slot: 1,
+            ..Default::default()
+        })
+        .await;
+    tas2780_c
+        .init(Config {
+            tdm_slot: 2,
+            ..Default::default()
+        })
+        .await;
+    tas2780_d
+        .init(Config {
+            tdm_slot: 3,
+            ..Default::default()
+        })
+        .await;
 
     loop {
-        let play = SAI_ACTIVE_SIGNAL.wait().await;
+        let source = SAI_ACTIVE_SIGNAL.wait().await;
 
-        if play {
+        if !matches!(source, AudioSource::None) {
+            debug!("Initialize TAS2780");
+
             for amplifier in [&mut tas2780_a, &mut tas2780_b, &mut tas2780_c, &mut tas2780_d] {
+                let mut config = amplifier.config();
+
+                match source {
+                    AudioSource::Spdif => {
+                        config.tdm_word_length = TdmWordLength::Word16Bit;
+                        config.tdm_time_slot_length = TdmTimeSlotLength::Slot16Bit;
+                    }
+                    _ => {
+                        config.tdm_word_length = TdmWordLength::Word32Bit;
+                        config.tdm_time_slot_length = TdmTimeSlotLength::Slot32Bit;
+                    }
+                };
+
+                amplifier.init(config).await;
                 amplifier.enable();
             }
+
+            AMP_SETUP_SIGNAL.signal(true);
         } else {
-            // FIXME: Implement disable?
+            AMP_SETUP_SIGNAL.signal(false);
         }
     }
 }
@@ -315,6 +313,7 @@ async fn spdif_task(
 
     info!("Start S/PDIF");
     spdif.start();
+
     loop {
         let data = sender.send().await;
 
@@ -475,7 +474,7 @@ async fn main(spawner: Spawner) {
     );
 
     // Basic USB device configuration
-    let mut config = embassy_usb::Config::new(0x1209, 0xaf02);
+    let mut config = embassy_usb::Config::new(0x1209, 0xaf03);
     config.manufacturer = Some("elagil");
     config.product = Some("blus-mini mk2");
     config.self_powered = true;

@@ -23,6 +23,23 @@ const SOFTWARE_RESET_REGISTER: RegisterAddress = 0x01;
 
 #[repr(u8)]
 #[derive(Clone, Copy)]
+pub enum TdmWordLength {
+    Word16Bit = 0x00,
+    Word20Bit = 0x01,
+    Word24Bit = 0x02,
+    Word32Bit = 0x03,
+}
+
+#[repr(u8)]
+#[derive(Clone, Copy)]
+pub enum TdmTimeSlotLength {
+    Slot16Bit = 0x00,
+    Slot24Bit = 0x01,
+    Slot32Bit = 0x02,
+}
+
+#[repr(u8)]
+#[derive(Clone, Copy)]
 /// The amplifier gain setting.
 pub enum Gain {
     Gain11_0dBV = 0x00,
@@ -95,15 +112,39 @@ pub struct NoiseGate {
     pub level: NoiseGateLevel,
 }
 
+#[derive(Clone, Copy)]
+pub struct Config {
+    pub gain: Gain,
+    pub channel: Channel,
+    pub tdm_slot: u8,
+    pub tdm_word_length: TdmWordLength,
+    pub tdm_time_slot_length: TdmTimeSlotLength,
+    pub noise_gate: Option<NoiseGate>,
+    pub power_mode: PowerMode,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Config {
+            gain: Gain::Gain11_0dBV,
+            tdm_slot: 0,
+            tdm_word_length: TdmWordLength::Word32Bit,
+            tdm_time_slot_length: TdmTimeSlotLength::Slot32Bit,
+            channel: Channel::Left,
+            noise_gate: Some(NoiseGate {
+                hysteresis: NoiseGateHysteresis::Duration1000ms,
+                level: NoiseGateLevel::ThresholdMinus90dBFS,
+            }),
+            power_mode: PowerMode::Two,
+        }
+    }
+}
+
 /// TAS2780 driver structure.
 pub struct Tas2780<'d, I2C> {
     i2c: &'d mut I2C,
     address: i2c::SevenBitAddress,
-    tdm_slot: u8,
-    channel: Channel,
-    gain: Gain,
-    power_mode: PowerMode,
-    noise_gate: Option<NoiseGate>,
+    config: Config,
     page: Option<u8>,
     book: Option<u8>,
 }
@@ -112,28 +153,13 @@ impl<'d, I2C> Tas2780<'d, I2C>
 where
     I2C: i2c::I2c,
 {
-    pub fn new(
-        i2c: &'d mut I2C,
-        address: i2c::SevenBitAddress,
-        tdm_slot: u8,
-        channel: Channel,
-        amplifier_level: Gain,
-        power_mode: PowerMode,
-        noise_gate: Option<NoiseGate>,
-    ) -> Self {
-        let page = None;
-        let book = None;
-
-        Self {
+    pub fn new(i2c: &'d mut I2C, address: i2c::SevenBitAddress) -> Self {
+        Tas2780 {
             i2c,
             address,
-            tdm_slot,
-            channel,
-            gain: amplifier_level,
-            power_mode,
-            noise_gate,
-            page,
-            book,
+            config: Config::default(),
+            page: None,
+            book: None,
         }
     }
 
@@ -210,10 +236,10 @@ where
 
     pub fn enable(&mut self) {
         // Set up power mode, and activate
-        match self.power_mode {
+        match self.config.power_mode {
             PowerMode::Two => {
                 self.set_page(0x00);
-                self.write_register(0x03, 0b11 << 6 | (self.gain as u8) << 1); // PWR_MODE2
+                self.write_register(0x03, 0b11 << 6 | (self.config.gain as u8) << 1); // PWR_MODE2
                 self.write_register(0x04, 0xA1); // Use internal LDO
                 self.write_register(0x71, 0x0E); // PVDD undervoltage lockout 6.5 V
                 self.write_register(0x02, 0x80); // Power up playback with I-sense, V-sense enabled
@@ -222,8 +248,14 @@ where
         }
     }
 
+    pub fn config(&self) -> Config {
+        self.config
+    }
+
     /// Initialize a TAS2780 amplifier to default settings.
-    pub async fn init(&mut self) {
+    pub async fn init(&mut self, config: Config) {
+        self.config = config;
+
         debug!("Initializing TAS2780 at address {}.", self.address);
 
         // Pre-reset configuration (as per the datasheet)
@@ -256,19 +288,19 @@ where
         self.set_page(0x00);
 
         let mut tdm_cfg2: RegisterValue = 0x00;
-        tdm_cfg2 |= 0b10; // RX_SLEN: 32 bit
-        tdm_cfg2 |= 0b11 << 2; // RX_WLEN: 32 bit
+        tdm_cfg2 |= self.config.tdm_time_slot_length as u8;
+        tdm_cfg2 |= (self.config.tdm_word_length as u8) << 2;
 
         let mut tdm_cfg3: RegisterValue = 0x00;
 
-        match self.channel {
+        match self.config.channel {
             Channel::Left => {
                 tdm_cfg2 |= 0b01 << 4; // RX_SCFG: Mono left channel
-                tdm_cfg3 |= self.tdm_slot
+                tdm_cfg3 |= self.config.tdm_slot
             }
             Channel::Right => {
                 tdm_cfg2 |= 0b10 << 4; // RX_SCFG: Mono right channel
-                tdm_cfg3 |= self.tdm_slot << 4
+                tdm_cfg3 |= self.config.tdm_slot << 4
             }
             Channel::StereoMix => {
                 tdm_cfg2 |= 0b11 << 4; // RX_SCFG: Stereo downmix (L+R)/2
@@ -280,7 +312,7 @@ where
         self.write_register(0x0C, tdm_cfg3);
 
         // Set up the noise gate, if enabled
-        if let Some(noise_gate) = self.noise_gate {
+        if let Some(noise_gate) = self.config.noise_gate {
             debug!("Enable TAS2780 noise gate.");
             const ENABLE_NOISE_GATE: u8 = 0b1;
 
@@ -291,7 +323,7 @@ where
         }
 
         // Set up power mode, and activate
-        match self.power_mode {
+        match self.config.power_mode {
             PowerMode::Two => {
                 self.set_page(0x01);
                 self.write_register(0x17, 0xC0); // SARBurstMask = 0

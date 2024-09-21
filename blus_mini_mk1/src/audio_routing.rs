@@ -57,7 +57,7 @@ pub async fn audio_routing_task(
 
             result.is_err()
         } else {
-            true
+            false
         };
 
         // Renew the I2S setup in case of errors.

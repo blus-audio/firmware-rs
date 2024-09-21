@@ -40,7 +40,7 @@ cortex-m = { version = "0.7.6", features = [
     "critical-section-single-core",
 ] }
 cortex-m-rt = "0.7.0"
-embassy-embedded-hal = { vpath = "../embassy/embassy-embedded-hal" }
+embassy-embedded-hal = { path = "../embassy/embassy-embedded-hal" }
 embedded-hal = "0.2.6"
 embedded-hal-bus = { version = "0.2", features = ["async"] }
 embedded-io = { version = "0.6.0" }
