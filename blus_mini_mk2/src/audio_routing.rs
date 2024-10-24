@@ -5,7 +5,8 @@ use embassy_stm32::gpio::Output;
 use embassy_stm32::{peripherals, sai};
 use embassy_sync::blocking_mutex::raw::NoopRawMutex;
 use embassy_sync::zerocopy_channel;
-use embassy_time::{Duration, Timer, WithTimeout as _};
+use embassy_time::WithTimeout;
+use embassy_time::{Duration, Timer};
 use grounded::uninit::GroundedArrayCell;
 use static_assertions;
 
@@ -233,6 +234,8 @@ pub async fn audio_routing_task(
             AudioSource::None
         };
 
+        // let audio_source = AudioSource::Spdif;
+
         let renew = match audio_source {
             AudioSource::RaspberryPi => {
                 let result = sai_rpi.read(&mut rpi_samples).await;
@@ -296,27 +299,28 @@ pub async fn audio_routing_task(
                     .with_timeout(Duration::from_millis(5))
                     .await;
 
-                if let Ok(samples) = result {
-                    let mut processed_samples = [0u32; 2 * SPDIF_SAMPLE_COUNT];
+                match result {
+                    Ok(samples) => {
+                        let mut processed_samples = [0u32; 2 * SPDIF_SAMPLE_COUNT];
 
-                    status_led.set_high();
-                    let output_sample_count =
-                        process(samples, &mut processed_samples, &mut filters, pot_gain.0, pot_gain.1);
+                        status_led.set_high();
+                        let output_sample_count =
+                            process(samples, &mut processed_samples, &mut filters, pot_gain.0, pot_gain.1);
 
-                    // FIXME: Explanation? 16 bit playback in 32 bit DMA mode.
-                    for sample in processed_samples.iter_mut() {
-                        *sample >>= 16;
+                        // FIXME: Explanation? 16 bit playback in 32 bit DMA mode.
+                        for sample in processed_samples.iter_mut() {
+                            *sample >>= 16;
+                        }
+                        status_led.set_low();
+
+                        let result = sai_amp.write(&processed_samples[..output_sample_count]).await;
+
+                        // Notify the channel that the buffer is now ready to be reused
+                        spdif_audio_receiver.receive_done();
+
+                        result.is_err()
                     }
-                    status_led.set_low();
-
-                    let result = sai_amp.write(&processed_samples[..output_sample_count]).await;
-
-                    // Notify the channel that the buffer is now ready to be reused
-                    spdif_audio_receiver.receive_done();
-
-                    result.is_err()
-                } else {
-                    true
+                    Err(_) => true,
                 }
             }
             _ => false,

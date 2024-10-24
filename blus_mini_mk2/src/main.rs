@@ -185,25 +185,25 @@ async fn amplifier_task(amplifier_resources: AmplifierResources) {
 
     tas2780_a
         .init(Config {
-            tdm_slot: 0,
+            tdm_slot: 3,
             ..Default::default()
         })
         .await;
     tas2780_b
         .init(Config {
-            tdm_slot: 1,
+            tdm_slot: 0,
             ..Default::default()
         })
         .await;
     tas2780_c
         .init(Config {
-            tdm_slot: 2,
+            tdm_slot: 1,
             ..Default::default()
         })
         .await;
     tas2780_d
         .init(Config {
-            tdm_slot: 3,
+            tdm_slot: 2,
             ..Default::default()
         })
         .await;
@@ -316,10 +316,12 @@ async fn spdif_task(
 
     loop {
         let data = sender.send().await;
-
         let result = spdif.read_data(data).await;
+        sender.send_done();
 
-        if result.is_err() {
+        if matches!(result, Err(spdifrx::Error::RingbufferError(_))) {
+            info!("Renew S/PDIF");
+
             drop(spdif);
             spdif = Spdifrx::new_data_only(
                 &mut resources.spdifrx,
@@ -329,10 +331,9 @@ async fn spdif_task(
                 &mut resources.dma,
                 buffer,
             );
+
             spdif.start();
         }
-
-        sender.send_done();
     }
 }
 
@@ -570,12 +571,22 @@ async fn main(spawner: Spawner) {
     let spdif_channel = SPDIF_CHANNEL.init(zerocopy_channel::Channel::new(spdif_sample_blocks));
     let (spdif_sender, spdif_receiver) = spdif_channel.split();
 
-    // Trigger on USB SOF (internal signal)
+    // Trigger a capture on USB SOF (internal signal)
     let mut tim2 = timer::low_level::Timer::new(p.TIM2);
     tim2.set_tick_freq(Hertz(FEEDBACK_COUNTER_TICK_RATE));
     tim2.set_trigger_source(timer::low_level::TriggerSource::ITR5);
-    tim2.set_slave_mode(timer::low_level::SlaveMode::TRIGGER_MODE);
-    tim2.regs_gp16().dier().modify(|r| r.set_tie(true));
+
+    const CHANNEL: timer::Channel = timer::Channel::Ch1;
+    tim2.set_input_ti_selection(CHANNEL, timer::low_level::InputTISelection::TRC);
+    tim2.set_input_capture_prescaler(CHANNEL, 0);
+    tim2.set_input_capture_filter(CHANNEL, timer::low_level::FilterValue::FCK_INT_N2);
+
+    // Reset all interrupt flags.
+    tim2.regs_gp32().sr().write(|r| r.0 = 0);
+
+    tim2.enable_channel(CHANNEL, true);
+    tim2.enable_input_interrupt(CHANNEL, true);
+
     tim2.start();
 
     TIMER.lock(|p| p.borrow_mut().replace(tim2));
@@ -618,23 +629,23 @@ fn TIM2() {
 
     critical_section::with(|cs| {
         // Read timer counter.
-        let ticks = TIMER.borrow(cs).borrow().as_ref().unwrap().regs_gp32().cnt().read();
+        let timer = TIMER.borrow(cs).borrow().as_ref().unwrap().regs_gp32();
+
+        let status = timer.sr().read();
+
+        const CHANNEL_INDEX: usize = 0;
+        if status.ccif(CHANNEL_INDEX) {
+            let ticks = timer.ccr(CHANNEL_INDEX).read();
+
+            *FRAME_COUNT += 1;
+            if *FRAME_COUNT >= FEEDBACK_REFRESH_PERIOD.frame_count() {
+                *FRAME_COUNT = 0;
+                FEEDBACK_SIGNAL.signal(ticks.wrapping_sub(*LAST_TICKS));
+                *LAST_TICKS = ticks;
+            }
+        };
 
         // Clear trigger interrupt flag.
-        TIMER
-            .borrow(cs)
-            .borrow_mut()
-            .as_mut()
-            .unwrap()
-            .regs_gp32()
-            .sr()
-            .modify(|r| r.set_tif(false));
-
-        *FRAME_COUNT += 1;
-        if *FRAME_COUNT >= FEEDBACK_REFRESH_PERIOD.frame_count() {
-            *FRAME_COUNT = 0;
-            FEEDBACK_SIGNAL.signal(ticks.wrapping_sub(*LAST_TICKS));
-            *LAST_TICKS = ticks;
-        }
+        timer.sr().modify(|r| r.set_tif(false));
     });
 }
