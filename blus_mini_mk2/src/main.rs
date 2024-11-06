@@ -5,7 +5,7 @@ use core::cell::RefCell;
 
 use audio::{self, AudioFilter, AudioSource};
 use blus_fw::*;
-use defmt::{debug, info, unwrap};
+use defmt::{debug, info, trace, unwrap};
 use embassy_embedded_hal::shared_bus::blocking::i2c::I2cDevice;
 use embassy_executor::Spawner;
 use embassy_stm32::adc::{self, AdcChannel};
@@ -41,8 +41,10 @@ static I2C_BUS: StaticCell<NoopMutex<RefCell<i2c::I2c<'static, Async>>>> = Stati
 #[link_section = ".sram1"]
 static mut ADC1_MEASUREMENT_BUFFER: GroundedArrayCell<u16, 1> = GroundedArrayCell::uninit();
 
+// Reserve twice the SPDIF sample count, since the DMA will transfer at
+// half-full interrupt (so, at SPDIF_SAMPLE_COUNT * 2 / 2).
 #[link_section = ".sram1"]
-static mut SPDIFRX_BUFFER: GroundedArrayCell<u32, SPDIF_SAMPLE_COUNT> = GroundedArrayCell::uninit();
+static mut SPDIFRX_BUFFER: GroundedArrayCell<u32, { SPDIF_SAMPLE_COUNT * 2 }> = GroundedArrayCell::uninit();
 
 #[allow(unused)]
 struct AmplifierResources {
@@ -62,7 +64,7 @@ struct AdcResources<T: adc::Instance> {
 struct SpdifResources {
     spdifrx: peripherals::SPDIFRX1,
     in_pin: peripherals::PD7,
-    dma: peripherals::DMA2_CH7,
+    dma: peripherals::DMA1_CH1,
 }
 
 pub fn get_filters() -> [AudioFilter<'static>; OUTPUT_CHANNEL_COUNT] {
@@ -302,16 +304,20 @@ async fn spdif_task(
         core::slice::from_raw_parts_mut(ptr, len)
     };
 
-    let mut spdif = Spdifrx::new_data_only(
-        &mut resources.spdifrx,
-        Irqs,
-        spdifrx::Config::default(),
-        &mut resources.in_pin,
-        &mut resources.dma,
-        buffer,
-    );
+    fn new_spdif<'d>(resources: &'d mut SpdifResources, buffer: &'d mut [u32]) -> Spdifrx<'d, peripherals::SPDIFRX1> {
+        Spdifrx::new_data_only(
+            &mut resources.spdifrx,
+            Irqs,
+            spdifrx::Config::default(),
+            &mut resources.in_pin,
+            &mut resources.dma,
+            buffer,
+        )
+    }
 
     info!("Start S/PDIF");
+
+    let mut spdif = new_spdif(&mut resources, buffer);
     spdif.start();
 
     loop {
@@ -319,21 +325,24 @@ async fn spdif_task(
         let result = spdif.read_data(data).await;
         sender.send_done();
 
-        if matches!(result, Err(spdifrx::Error::RingbufferError(_))) {
-            info!("Renew S/PDIF");
-
-            drop(spdif);
-            spdif = Spdifrx::new_data_only(
-                &mut resources.spdifrx,
-                Irqs,
-                spdifrx::Config::default(),
-                &mut resources.in_pin,
-                &mut resources.dma,
-                buffer,
-            );
-
-            spdif.start();
-        }
+        match result {
+            Ok(_) => (),
+            Err(spdifrx::Error::RingbufferError(_)) => {
+                trace!("SPDIFRX ringbuffer error. Renew.");
+                drop(spdif);
+                spdif = new_spdif(&mut resources, buffer);
+                spdif.start();
+                continue;
+            }
+            Err(spdifrx::Error::ChannelSyncError) => {
+                trace!("SPDIFRX channel sync (left/right assignment) error.");
+                continue;
+            }
+            Err(spdifrx::Error::SourceSyncError) => {
+                trace!("SPDIFRX source sync error, e.g. disconnect.");
+                continue;
+            }
+        };
     }
 }
 
@@ -392,9 +401,6 @@ async fn main(spawner: Spawner) {
 
     // Enable instruction cache.
     core_peri.SCB.enable_icache();
-
-    // FIXME: Enable data chache, but configure DMA MPU first.
-    // core_peri.SCB.enable_dcache(&mut core_peri.CPUID);
 
     let mut led_blue = Output::new(p.PC6, Level::Low, Speed::Low);
     let mut led_green = Output::new(p.PC7, Level::Low, Speed::Low);
@@ -550,7 +556,7 @@ async fn main(spawner: Spawner) {
     let spdif_resources = SpdifResources {
         spdifrx: p.SPDIFRX1,
         in_pin: p.PD7,
-        dma: p.DMA2_CH7,
+        dma: p.DMA1_CH1,
     };
 
     // FIXME: deduplicate
