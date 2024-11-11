@@ -321,7 +321,7 @@ async fn spdif_task(
     let mut spdif = new_spdif(&mut resources, buffer);
     spdif.start();
 
-    let mut ticker = Ticker::every(Duration::from_millis(10));
+    let mut ticker = Ticker::every(Duration::from_millis(100));
 
     loop {
         let mut data = [0u32; SPDIF_SAMPLE_COUNT];
@@ -345,7 +345,10 @@ async fn spdif_task(
                 spdif = new_spdif(&mut resources, buffer);
                 spdif.start();
             }
-            _ => (),
+            Err(_) => {
+                // Limit loop period.
+                ticker.next().await;
+            }
         };
     }
 }
