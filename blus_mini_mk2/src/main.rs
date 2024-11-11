@@ -18,7 +18,7 @@ use embassy_stm32::{bind_interrupts, i2c, interrupt, peripherals, timer, usb};
 use embassy_sync::blocking_mutex::raw::{CriticalSectionRawMutex, NoopRawMutex};
 use embassy_sync::blocking_mutex::{Mutex, NoopMutex};
 use embassy_sync::zerocopy_channel;
-use embassy_time::{Duration, Ticker, Timer, WithTimeout};
+use embassy_time::{Duration, Ticker, Timer};
 use embassy_usb::class::uac1;
 use embassy_usb::class::uac1::speaker::{self, Speaker};
 use grounded::uninit::GroundedArrayCell;
@@ -340,7 +340,7 @@ async fn spdif_task(
                 // Limit renewal rate.
                 ticker.next().await;
 
-                info!("SPDIFRX ringbuffer error. Renew.");
+                trace!("SPDIFRX ringbuffer error. Renew.");
                 drop(spdif);
                 spdif = new_spdif(&mut resources, buffer);
                 spdif.start();
@@ -348,6 +348,8 @@ async fn spdif_task(
             Err(_) => {
                 // Limit loop period.
                 ticker.next().await;
+
+                trace!("SPDIFRX error.");
             }
         };
     }
@@ -614,6 +616,15 @@ async fn main(spawner: Spawner) {
     unwrap!(spawner.spawn(usb_audio::feedback_task(feedback)));
     unwrap!(spawner.spawn(usb_audio::usb_task(usb_device)));
 
+    // Volume control.
+    unwrap!(spawner.spawn(potentiometer_task(adc_resources)));
+
+    // Amplifier setup and control.
+    unwrap!(spawner.spawn(amplifier_task(amplifier_resources)));
+
+    // S/PDIF data reception.
+    unwrap!(spawner.spawn(spdif_task(spdif_resources, spdif_sender)));
+
     // Launch audio routing.
     unwrap!(spawner.spawn(audio_routing::audio_routing_task(
         get_filters(),
@@ -625,15 +636,6 @@ async fn main(spawner: Spawner) {
         led_yellow,
         led_green
     )));
-
-    // Volume control.
-    unwrap!(spawner.spawn(potentiometer_task(adc_resources)));
-
-    // Amplifier setup and control.
-    unwrap!(spawner.spawn(amplifier_task(amplifier_resources)));
-
-    // S/PDIF data reception.
-    unwrap!(spawner.spawn(spdif_task(spdif_resources, spdif_sender)));
 }
 
 #[interrupt]
