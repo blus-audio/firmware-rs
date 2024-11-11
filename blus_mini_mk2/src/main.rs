@@ -5,6 +5,7 @@ use core::cell::RefCell;
 
 use audio::{self, AudioFilter, AudioSource};
 use blus_fw::*;
+use core::sync::atomic::Ordering::Relaxed;
 use defmt::{debug, info, trace, unwrap};
 use embassy_embedded_hal::shared_bus::blocking::i2c::I2cDevice;
 use embassy_executor::Spawner;
@@ -17,7 +18,7 @@ use embassy_stm32::{bind_interrupts, i2c, interrupt, peripherals, timer, usb};
 use embassy_sync::blocking_mutex::raw::{CriticalSectionRawMutex, NoopRawMutex};
 use embassy_sync::blocking_mutex::{Mutex, NoopMutex};
 use embassy_sync::zerocopy_channel;
-use embassy_time::{Duration, Ticker, Timer};
+use embassy_time::{Duration, Ticker, Timer, WithTimeout};
 use embassy_usb::class::uac1;
 use embassy_usb::class::uac1::speaker::{self, Speaker};
 use grounded::uninit::GroundedArrayCell;
@@ -320,28 +321,31 @@ async fn spdif_task(
     let mut spdif = new_spdif(&mut resources, buffer);
     spdif.start();
 
+    let mut ticker = Ticker::every(Duration::from_millis(10));
+
     loop {
-        let data = sender.send().await;
-        let result = spdif.read_data(data).await;
-        sender.send_done();
+        let mut data = [0u32; SPDIF_SAMPLE_COUNT];
+        let result = spdif.read_data(&mut data).await;
+
+        SPDIF_IS_STREAMING.store(result.is_ok(), Relaxed);
 
         match result {
-            Ok(_) => (),
+            Ok(_) => {
+                if let Some(send_data) = sender.try_send() {
+                    send_data.copy_from_slice(data.as_slice());
+                    sender.send_done();
+                }
+            }
             Err(spdifrx::Error::RingbufferError(_)) => {
-                trace!("SPDIFRX ringbuffer error. Renew.");
+                // Limit renewal rate.
+                ticker.next().await;
+
+                info!("SPDIFRX ringbuffer error. Renew.");
                 drop(spdif);
                 spdif = new_spdif(&mut resources, buffer);
                 spdif.start();
-                continue;
             }
-            Err(spdifrx::Error::ChannelSyncError) => {
-                trace!("SPDIFRX channel sync (left/right assignment) error.");
-                continue;
-            }
-            Err(spdifrx::Error::SourceSyncError) => {
-                trace!("SPDIFRX source sync error, e.g. disconnect.");
-                continue;
-            }
+            _ => (),
         };
     }
 }
@@ -625,6 +629,7 @@ async fn main(spawner: Spawner) {
     // Amplifier setup and control.
     unwrap!(spawner.spawn(amplifier_task(amplifier_resources)));
 
+    // S/PDIF data reception.
     unwrap!(spawner.spawn(spdif_task(spdif_resources, spdif_sender)));
 }
 

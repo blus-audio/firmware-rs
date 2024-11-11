@@ -52,7 +52,7 @@ pub const SPDIF_SAMPLE_COUNT: usize = SAMPLE_SIZE_PER_MS / SAMPLE_SIZE;
 
 // Task communication
 pub static USB_IS_STREAMING: AtomicBool = AtomicBool::new(false);
-pub static RPI_IS_STREAMING: AtomicBool = AtomicBool::new(false);
+pub static SPDIF_IS_STREAMING: AtomicBool = AtomicBool::new(false);
 
 pub static FEEDBACK_SIGNAL: Signal<CriticalSectionRawMutex, u32> = Signal::new();
 pub static SAI_ACTIVE_SIGNAL: Signal<ThreadModeRawMutex, AudioSource> = Signal::new();

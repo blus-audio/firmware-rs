@@ -82,18 +82,20 @@ async fn stream_handler<'d, T: usb::Instance + 'd>(
 
         if word_count * SAMPLE_SIZE == data_size {
             // Obtain a buffer from the channel
-            let samples = sender.send().await;
-            samples.clear();
+            if let Some(samples) = sender.try_send() {
+                samples.clear();
 
-            for w in 0..word_count {
-                let byte_offset = w * SAMPLE_SIZE;
-                let sample = u32::from_le_bytes(usb_data[byte_offset..byte_offset + SAMPLE_SIZE].try_into().unwrap());
+                for w in 0..word_count {
+                    let byte_offset = w * SAMPLE_SIZE;
+                    let sample =
+                        u32::from_le_bytes(usb_data[byte_offset..byte_offset + SAMPLE_SIZE].try_into().unwrap());
 
-                // Fill the sample buffer with data.
-                samples.push(sample).unwrap();
+                    // Fill the sample buffer with data.
+                    samples.push(sample).unwrap();
+                }
+
+                sender.send_done();
             }
-
-            sender.send_done();
         } else {
             debug!("Invalid USB buffer size of {}, skipped.", data_size);
         }

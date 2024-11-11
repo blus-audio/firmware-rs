@@ -213,9 +213,14 @@ pub async fn audio_routing_task(
     let mut pot_gain = (0.0, 0.0);
 
     let mut rpi_samples = [0u32; SAI_RPI_SAMPLE_COUNT];
+    let mut rpi_is_streaming = false;
+
+    let mut last_audio_source = AudioSource::None;
 
     sai_amp.start();
     sai_rpi.start();
+
+    let mut renew = true;
 
     loop {
         // Update the audio source.
@@ -224,19 +229,51 @@ pub async fn audio_routing_task(
         }
 
         // Source prioritization is determined by the order of checks.
-        let audio_source = if RPI_IS_STREAMING.load(Relaxed) {
+        let audio_source = if rpi_is_streaming {
             led_rpi.set_high();
             AudioSource::RaspberryPi
         } else if USB_IS_STREAMING.load(Relaxed) {
             led_usb.set_high();
             AudioSource::Usb
+        } else if SPDIF_IS_STREAMING.load(Relaxed) {
+            led_spdif.set_high();
+            AudioSource::Spdif
         } else {
             AudioSource::None
         };
 
-        // let audio_source = AudioSource::Spdif;
+        if last_audio_source != audio_source {
+            info!("New source: {}", audio_source);
+            last_audio_source = audio_source;
+            renew = true;
+        };
 
-        let renew = match audio_source {
+        // Renew the SAI setup.
+        if renew {
+            info!("Renew SAI");
+
+            drop(sai_amp);
+            drop(sai_rpi);
+
+            SAI_ACTIVE_SIGNAL.signal(audio_source);
+            AMP_SETUP_SIGNAL.wait().await;
+
+            (sai_amp, sai_rpi) = new_sai_amp_rpi(
+                &mut sai4_resources,
+                sai_amp_write_buffer,
+                sai_rpi_read_buffer,
+                SAMPLE_RATE_HZ,
+                audio_source,
+            );
+
+            sai_amp.start();
+            sai_rpi.start();
+        } else {
+            // Check, if there is a signal stream arriving from the Raspberry Pi header.
+            rpi_is_streaming = !sai_rpi.is_muted().unwrap();
+        }
+
+        renew = match audio_source {
             AudioSource::RaspberryPi => {
                 let result = sai_rpi.read(&mut rpi_samples).await;
 
@@ -283,11 +320,6 @@ pub async fn audio_routing_task(
                     true
                 }
             }
-            AudioSource::None => {
-                sai_amp.set_mute(true);
-                Timer::after_millis(100).await;
-                false
-            }
             AudioSource::Spdif => {
                 if let Some(gain) = POT_GAIN_SIGNAL.try_take() {
                     pot_gain = (gain, gain);
@@ -299,56 +331,35 @@ pub async fn audio_routing_task(
                     .with_timeout(Duration::from_millis(5))
                     .await;
 
-                match result {
-                    Ok(samples) => {
-                        let mut processed_samples = [0u32; 2 * SPDIF_SAMPLE_COUNT];
+                if let Ok(samples) = result {
+                    let mut processed_samples = [0u32; 2 * SPDIF_SAMPLE_COUNT];
 
-                        status_led.set_high();
-                        let output_sample_count =
-                            process(samples, &mut processed_samples, &mut filters, pot_gain.0, pot_gain.1);
+                    status_led.set_high();
+                    let output_sample_count =
+                        process(samples, &mut processed_samples, &mut filters, pot_gain.0, pot_gain.1);
 
-                        // FIXME: Explanation? 16 bit playback in 32 bit DMA mode.
-                        for sample in processed_samples.iter_mut() {
-                            *sample >>= 16;
-                        }
-                        status_led.set_low();
-
-                        let result = sai_amp.write(&processed_samples[..output_sample_count]).await;
-
-                        // Notify the channel that the buffer is now ready to be reused
-                        spdif_audio_receiver.receive_done();
-
-                        result.is_err()
+                    // FIXME: Explanation? 16 bit playback in 32 bit DMA mode.
+                    for sample in processed_samples.iter_mut() {
+                        *sample >>= 16;
                     }
-                    Err(_) => true,
+                    status_led.set_low();
+
+                    let result = sai_amp.write(&processed_samples[..output_sample_count]).await;
+
+                    // Notify the channel that the buffer is now ready to be reused
+                    spdif_audio_receiver.receive_done();
+
+                    result.is_err()
+                } else {
+                    true
                 }
+            }
+            AudioSource::None => {
+                sai_amp.set_mute(true);
+                Timer::after_millis(10).await;
+                false
             }
             _ => false,
         };
-
-        // Renew the SAI setup in case of errors.
-        if renew {
-            info!("Renew SAI");
-
-            drop(sai_amp);
-            drop(sai_rpi);
-
-            SAI_ACTIVE_SIGNAL.signal(audio_source);
-            AMP_SETUP_SIGNAL.wait().await;
-
-            (sai_amp, sai_rpi) = new_sai_amp_rpi(
-                &mut sai4_resources,
-                sai_amp_write_buffer,
-                sai_rpi_read_buffer,
-                SAMPLE_RATE_HZ,
-                audio_source,
-            );
-
-            sai_amp.start();
-            sai_rpi.start();
-        } else {
-            // Check, if there is a signal stream arriving from the Raspberry Pi header.
-            RPI_IS_STREAMING.store(!sai_rpi.is_muted().unwrap(), Relaxed);
-        }
     }
 }
