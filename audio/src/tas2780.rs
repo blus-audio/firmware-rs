@@ -7,19 +7,13 @@ type RegisterAddress = u8;
 type RegisterValue = u8;
 
 /// The volume at which the amplifier is muted
-pub const MUTE_VOLUME: u8 = 0xFF;
+pub const MUTED_VOLUME: u8 = 0xFF;
 
 /// The currently active page
 const PAGE_REGISTER: RegisterAddress = 0x00;
 
 /// The currently active book
 const BOOK_REGISTER: RegisterAddress = 0x7F;
-
-/// Digital volume control
-const DVC_REGISTER: RegisterAddress = 0x1A;
-
-/// Software reset
-const SOFTWARE_RESET_REGISTER: RegisterAddress = 0x01;
 
 #[repr(u8)]
 #[derive(Clone, Copy)]
@@ -215,6 +209,9 @@ where
     pub fn set_volume(&mut self, attenuation_half_db: u8) {
         self.set_page(0);
 
+        /// Digital volume control
+        const DVC_REGISTER: RegisterAddress = 0x1A;
+
         // FIXME: convert volume
         self.write_register(DVC_REGISTER, attenuation_half_db)
     }
@@ -223,6 +220,9 @@ where
         // Return to default page and book.
         self.set_page(0);
         self.set_book(0);
+
+        /// Software reset
+        const SOFTWARE_RESET_REGISTER: RegisterAddress = 0x01;
 
         // Perform soft reset.
         self.write_register(SOFTWARE_RESET_REGISTER, 0x01);
@@ -284,40 +284,57 @@ where
         self.write_register(0x06, 0xC1); // Set Dmin
         self.write_register(0x06, 0xD5); // Set Dmin
 
-        // Set up channel configuration
         self.set_page(0x00);
 
-        let mut tdm_cfg2: RegisterValue = 0x00;
-        tdm_cfg2 |= self.config.tdm_time_slot_length as u8;
-        tdm_cfg2 |= (self.config.tdm_word_length as u8) << 2;
+        // Clock-based power features
+        const INT_CLK_CFG_REGISTER: RegisterAddress = 0x5C;
+        let int_clk_cfg = 0x1 << 7 // Enable clock-based power up/down feature
+        | 0x3 << 3; // 52.42 ms clock error detection period
 
+        self.write_register(INT_CLK_CFG_REGISTER, int_clk_cfg);
+
+        // Set up TDM/channel configuration
+        let tdm_cfg1: RegisterValue = 0x00;
+        let mut tdm_cfg2: RegisterValue = 0x00;
         let mut tdm_cfg3: RegisterValue = 0x00;
+
+        tdm_cfg2 |= (self.config.tdm_time_slot_length as u8) & 0b11;
+        tdm_cfg2 |= ((self.config.tdm_word_length as u8) & 0b11) << 2;
 
         match self.config.channel {
             Channel::Left => {
                 tdm_cfg2 |= 0b01 << 4; // RX_SCFG: Mono left channel
-                tdm_cfg3 |= self.config.tdm_slot
+                tdm_cfg3 |= self.config.tdm_slot & 0xF;
             }
             Channel::Right => {
                 tdm_cfg2 |= 0b10 << 4; // RX_SCFG: Mono right channel
-                tdm_cfg3 |= self.config.tdm_slot << 4
+                tdm_cfg3 |= (self.config.tdm_slot & 0xF) << 4;
             }
             Channel::StereoMix => {
                 tdm_cfg2 |= 0b11 << 4; // RX_SCFG: Stereo downmix (L+R)/2
-                tdm_cfg3 |= 0x01 << 4
+
+                // FIXME: channel selection in tdm_cfg3
             }
         }
 
-        self.write_register(0x0A, tdm_cfg2);
-        self.write_register(0x0C, tdm_cfg3);
+        const TDM_CFG1_REGISTER: RegisterAddress = 0x09;
+        const TDM_CFG2_REGISTER: RegisterAddress = 0x0A;
+        const TDM_CFG3_REGISTER: RegisterAddress = 0x0C;
+
+        self.write_register(TDM_CFG1_REGISTER, tdm_cfg1);
+        self.write_register(TDM_CFG2_REGISTER, tdm_cfg2);
+        self.write_register(TDM_CFG3_REGISTER, tdm_cfg3);
 
         // Set up the noise gate, if enabled
         if let Some(noise_gate) = self.config.noise_gate {
             debug!("Enable TAS2780 noise gate.");
             const ENABLE_NOISE_GATE: u8 = 0b1;
 
+            /// Noise gate config register 0
+            const NG_CFG0_REGISTER: RegisterAddress = 0x35;
+
             self.write_register(
-                0x35,
+                NG_CFG0_REGISTER,
                 (noise_gate.hysteresis as u8) << 5 | (noise_gate.level as u8) << 3 | ENABLE_NOISE_GATE << 2 | 0b01,
             );
         }
@@ -338,8 +355,6 @@ where
             }
             _ => todo!("Unsupported power mode."),
         }
-
-        self.enable();
 
         // Set maximum volume (0 dB)
         self.set_volume(0);

@@ -18,7 +18,7 @@ use embassy_stm32::{bind_interrupts, i2c, interrupt, peripherals, timer, usb};
 use embassy_sync::blocking_mutex::raw::{CriticalSectionRawMutex, NoopRawMutex};
 use embassy_sync::blocking_mutex::{Mutex, NoopMutex};
 use embassy_sync::zerocopy_channel;
-use embassy_time::{Duration, Ticker, Timer};
+use embassy_time::{Duration, Ticker, Timer, WithTimeout};
 use embassy_usb::class::uac1;
 use embassy_usb::class::uac1::speaker::{self, Speaker};
 use grounded::uninit::GroundedArrayCell;
@@ -188,25 +188,25 @@ async fn amplifier_task(amplifier_resources: AmplifierResources) {
 
     tas2780_a
         .init(Config {
-            tdm_slot: 3,
+            tdm_slot: 0,
             ..Default::default()
         })
         .await;
     tas2780_b
         .init(Config {
-            tdm_slot: 0,
+            tdm_slot: 1,
             ..Default::default()
         })
         .await;
     tas2780_c
         .init(Config {
-            tdm_slot: 1,
+            tdm_slot: 2,
             ..Default::default()
         })
         .await;
     tas2780_d
         .init(Config {
-            tdm_slot: 2,
+            tdm_slot: 3,
             ..Default::default()
         })
         .await;
@@ -321,13 +321,11 @@ async fn spdif_task(
     let mut spdif = new_spdif(&mut resources, buffer);
     spdif.start();
 
-    let mut ticker = Ticker::every(Duration::from_millis(100));
-
     loop {
         let mut data = [0u32; SPDIF_SAMPLE_COUNT];
         let result = spdif.read_data(&mut data).await;
 
-        SPDIF_IS_STREAMING.store(result.is_ok(), Relaxed);
+        // SPDIF_IS_STREAMING.store(result.is_ok(), Relaxed);
 
         match result {
             Ok(_) => {
@@ -337,20 +335,13 @@ async fn spdif_task(
                 }
             }
             Err(spdifrx::Error::RingbufferError(_)) => {
-                // Limit renewal rate.
-                ticker.next().await;
-
-                trace!("SPDIFRX ringbuffer error. Renew.");
+                info!("SPDIFRX ringbuffer error. Renew.");
                 drop(spdif);
                 spdif = new_spdif(&mut resources, buffer);
                 spdif.start();
             }
-            Err(_) => {
-                // Limit loop period.
-                ticker.next().await;
-
-                trace!("SPDIFRX error.");
-            }
+            Err(spdifrx::Error::ChannelSyncError) => info!("SPDIFRX channel sync error"),
+            Err(spdifrx::Error::SourceSyncError) => info!("SPDIFRX source sync error"),
         };
     }
 }
@@ -623,7 +614,7 @@ async fn main(spawner: Spawner) {
     unwrap!(spawner.spawn(amplifier_task(amplifier_resources)));
 
     // S/PDIF data reception.
-    unwrap!(spawner.spawn(spdif_task(spdif_resources, spdif_sender)));
+    // unwrap!(spawner.spawn(spdif_task(spdif_resources, spdif_sender)));
 
     // Launch audio routing.
     unwrap!(spawner.spawn(audio_routing::audio_routing_task(
