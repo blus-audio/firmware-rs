@@ -1,27 +1,26 @@
 use audio::{audio_filter, AudioFilter};
 use core::sync::atomic::Ordering::Relaxed;
-use defmt::{info, panic};
+use defmt::{debug, info, panic};
 use embassy_stm32::gpio::Output;
 use embassy_stm32::sai::word;
 use embassy_stm32::{peripherals, sai};
 use embassy_sync::blocking_mutex::raw::NoopRawMutex;
-use embassy_sync::zerocopy_channel;
-use embassy_time::{Duration, Timer};
-use embassy_time::{Ticker, WithTimeout};
+use embassy_sync::channel;
+use embassy_time::{Duration, WithTimeout};
 use grounded::uninit::GroundedArrayCell;
 use static_assertions;
 
 use crate::*;
 
-// Factor of two for being able to buffer two full USB packets (excessive)
-const SAI_AMP_SAMPLE_COUNT: usize = 2 * USB_MAX_SAMPLE_COUNT;
+// Generous sample buffer
+const SAI_AMP_SAMPLE_COUNT: usize = 2 * (OUTPUT_CHANNEL_COUNT / INPUT_CHANNEL_COUNT) * MAX_SAMPLE_COUNT;
 
 // Buffer of around 1 ms size
 const SAI_RPI_SAMPLE_COUNT: usize = SAMPLE_SIZE_PER_S.div_ceil(1000) / SAMPLE_SIZE;
 
 // Do not exceed the write buffer (after processing) with samples from the Raspberry Pi.
 static_assertions::const_assert!(
-    SAI_RPI_SAMPLE_COUNT <= (OUTPUT_CHANNEL_COUNT / INPUT_CHANNEL_COUNT) * SAI_AMP_SAMPLE_COUNT
+    (OUTPUT_CHANNEL_COUNT / INPUT_CHANNEL_COUNT) * SAI_RPI_SAMPLE_COUNT <= SAI_AMP_SAMPLE_COUNT
 );
 
 #[allow(unused)]
@@ -156,35 +155,40 @@ fn new_sai_amp_rpi<'d>(
 
 fn process(
     samples: &[u32],
-    processed_samples: &mut [u32],
+    processed_samples: &mut Vec<u32, { 2 * MAX_SAMPLE_COUNT }>,
     filters: &mut [AudioFilter; OUTPUT_CHANNEL_COUNT],
     gain_left: f32,
     gain_right: f32,
-) -> usize {
+) {
     for index in 0..samples.len() {
         let sample = audio_filter::sample_to_f32(samples[index]);
 
         if index % 2 == 0 {
             // Left channel
-            processed_samples[2 * index] = audio_filter::sample_to_u32(filters[0].run(sample) * gain_left);
-            processed_samples[2 * index + 1] = audio_filter::sample_to_u32(filters[1].run(sample) * gain_left);
+            processed_samples
+                .push(audio_filter::sample_to_u32(filters[0].run(sample) * gain_left))
+                .unwrap();
+            processed_samples
+                .push(audio_filter::sample_to_u32(filters[1].run(sample) * gain_left))
+                .unwrap();
         } else {
             // Right channel
-            processed_samples[2 * index] = audio_filter::sample_to_u32(filters[2].run(sample) * gain_right);
-            processed_samples[2 * index + 1] = audio_filter::sample_to_u32(filters[3].run(sample) * gain_right);
+            processed_samples
+                .push(audio_filter::sample_to_u32(filters[2].run(sample) * gain_right))
+                .unwrap();
+            processed_samples
+                .push(audio_filter::sample_to_u32(filters[3].run(sample) * gain_right))
+                .unwrap();
         }
     }
-
-    2 * samples.len()
 }
 
 #[embassy_executor::task]
 pub async fn audio_routing_task(
     mut filters: [AudioFilter<'static>; OUTPUT_CHANNEL_COUNT],
     mut sai4_resources: Sai4Resources,
-    mut usb_audio_receiver: zerocopy_channel::Receiver<'static, NoopRawMutex, UsbSampleBlock>,
-    mut spdif_audio_receiver: zerocopy_channel::Receiver<'static, NoopRawMutex, SpdifSampleBlock>,
-    mut status_led: Output<'static>,
+    audio_receiver: channel::Receiver<'static, NoopRawMutex, SampleBlock, SAMPLE_BLOCK_COUNT>,
+    mut led_status: Output<'static>,
     mut led_usb: Output<'static>,
     mut led_rpi: Output<'static>,
     mut led_spdif: Output<'static>,
@@ -212,168 +216,28 @@ pub async fn audio_routing_task(
         AudioSource::None,
     );
 
-    #[derive(Debug, defmt::Format, PartialEq, Clone, Copy)]
-    enum State {
-        Waiting,
-        Streaming,
-    }
+    let mut write_err = false;
 
     let mut source = AudioSource::None;
     let mut last_source = source;
 
-    let mut state = State::Waiting;
-
     let mut usb_gain = (0.0, 0.0);
     let mut pot_gain = (0.0, 0.0);
 
-    let mut rpi_samples = [0u32; SAI_RPI_SAMPLE_COUNT];
-
-    let mut ticker = Ticker::every(Duration::from_millis(100));
+    sai_rpi.start().unwrap();
 
     loop {
-        for led in [&mut led_usb, &mut led_rpi, &mut led_spdif] {
+        for led in [&mut led_usb, &mut led_rpi, &mut led_spdif, &mut led_status] {
             led.set_low();
         }
 
-        let success = match source {
-            AudioSource::RaspberryPi => {
-                led_rpi.set_high();
-                let timeout_result = sai_rpi
-                    .read(&mut rpi_samples)
-                    .with_timeout(Duration::from_millis(5))
-                    .await;
-
-                if timeout_result.is_ok() {
-                    let mut processed_samples = [0u32; 2 * SAI_RPI_SAMPLE_COUNT];
-
-                    status_led.set_high();
-                    let output_sample_count = process(&rpi_samples, &mut processed_samples, &mut filters, 1.0, 1.0);
-                    status_led.set_low();
-
-                    let result = sai_amp.write(&processed_samples[..output_sample_count]).await;
-
-                    result.is_ok()
-                } else {
-                    false
-                }
-            }
-            AudioSource::Usb => {
-                led_usb.set_high();
-                if let Some(gain) = USB_GAIN_SIGNAL.try_take() {
-                    usb_gain = gain;
-                }
-
-                // Data should arrive at least once every millisecond.
-                let timeout_result = usb_audio_receiver
-                    .receive()
-                    .with_timeout(Duration::from_millis(5))
-                    .await;
-
-                if let Ok(samples) = timeout_result {
-                    let mut processed_samples = [0u32; 2 * USB_MAX_SAMPLE_COUNT];
-
-                    status_led.set_high();
-                    let output_sample_count =
-                        process(samples, &mut processed_samples, &mut filters, usb_gain.0, usb_gain.1);
-                    status_led.set_low();
-
-                    let result = sai_amp.write(&processed_samples[..output_sample_count]).await;
-
-                    // Notify the channel that the buffer is now ready to be reused
-                    usb_audio_receiver.receive_done();
-
-                    result.is_ok()
-                } else {
-                    false
-                }
-            }
-            AudioSource::Spdif => {
-                led_spdif.set_high();
-                if let Some(gain) = POT_GAIN_SIGNAL.try_take() {
-                    pot_gain = (gain, gain);
-                }
-
-                // Data should arrive once every millisecond.
-                let timeout_result = spdif_audio_receiver
-                    .receive()
-                    .with_timeout(Duration::from_millis(5))
-                    .await;
-
-                if let Ok(samples) = timeout_result {
-                    let mut processed_samples = [0u32; 2 * SPDIF_SAMPLE_COUNT];
-
-                    status_led.set_high();
-                    let output_sample_count =
-                        process(samples, &mut processed_samples, &mut filters, pot_gain.0, pot_gain.1);
-
-                    // FIXME: Explanation? 16 bit playback in 32 bit DMA mode.
-                    for sample in processed_samples.iter_mut() {
-                        *sample >>= 16;
-                    }
-                    status_led.set_low();
-
-                    let result = sai_amp.write(&processed_samples[..output_sample_count]).await;
-
-                    // Notify the channel that the buffer is now ready to be reused
-                    spdif_audio_receiver.receive_done();
-
-                    result.is_ok()
-                } else {
-                    false
-                }
-            }
-            _ => {
-                // Limit loop rate with no source.
-                ticker.next().await;
-                true
-            }
-        };
-
-        let new_state = match state {
-            State::Waiting => {
-                if success {
-                    info!("Renew SAI");
-
-                    drop(sai_amp);
-                    drop(sai_rpi);
-
-                    (sai_amp, sai_rpi) = new_sai_amp_rpi(
-                        &mut sai4_resources,
-                        sai_amp_write_buffer,
-                        sai_rpi_read_buffer,
-                        SAMPLE_RATE_HZ,
-                        source,
-                    );
-
-                    SAI_ACTIVE_SIGNAL.signal(source);
-                    AMP_SETUP_SIGNAL.wait().await;
-
-                    sai_amp.start();
-                    sai_rpi.start();
-
-                    State::Streaming
-                } else {
-                    sai_amp.set_mute(true);
-                    state
-                }
-            }
-            State::Streaming => {
-                if success {
-                    state
-                } else {
-                    State::Waiting
-                }
-            }
-        };
-
-        if new_state != state {
-            info!("State {} -> {}", state, new_state);
-            state = new_state;
-        }
+        let rpi_is_streaming = false; // !sai_rpi.is_muted().unwrap();
 
         // Source prioritization is determined by the order of checks.
-        let rpi_is_streaming = false; // !sai_rpi.is_muted().unwrap();
-        source = if rpi_is_streaming {
+        source = if write_err {
+            write_err = false;
+            AudioSource::None
+        } else if rpi_is_streaming {
             led_rpi.set_high();
             AudioSource::RaspberryPi
         } else if USB_IS_STREAMING.load(Relaxed) {
@@ -386,11 +250,76 @@ pub async fn audio_routing_task(
             AudioSource::None
         };
 
-        if last_source != source {
+        let source_changed = last_source != source;
+        if source_changed {
             info!("New source: {}", source);
-
-            state = State::Waiting;
             last_source = source;
+
+            drop(sai_amp);
+            drop(sai_rpi);
+
+            (sai_amp, sai_rpi) = new_sai_amp_rpi(
+                &mut sai4_resources,
+                sai_amp_write_buffer,
+                sai_rpi_read_buffer,
+                SAMPLE_RATE_HZ,
+                source,
+            );
+
+            SAI_ACTIVE_SIGNAL.signal(source);
+            AMP_SETUP_SIGNAL.wait().await;
+
+            audio_receiver.clear();
+            sai_rpi.start().unwrap();
+        }
+
+        let Ok(sample_block) = audio_receiver.receive().with_timeout(Duration::from_millis(10)).await else {
+            sai_amp.set_mute(true);
+            continue;
         };
+
+        led_status.set_high();
+
+        let mut processed_samples: Vec<u32, { 2 * MAX_SAMPLE_COUNT }> = Vec::new();
+
+        match (sample_block, source) {
+            (SampleBlock::Spdif(samples), AudioSource::Spdif) => {
+                if let Some(gain) = POT_GAIN_SIGNAL.try_take() {
+                    pot_gain = (gain, gain);
+                }
+
+                process(
+                    samples.as_slice(),
+                    &mut processed_samples,
+                    &mut filters,
+                    pot_gain.0,
+                    pot_gain.1,
+                );
+
+                // 16 bit playback in 32 bit DMA mode.
+                for sample in processed_samples.iter_mut() {
+                    *sample >>= 16;
+                }
+            }
+            (SampleBlock::Usb(samples), AudioSource::Usb) => {
+                if let Some(gain) = USB_GAIN_SIGNAL.try_take() {
+                    usb_gain = gain;
+                }
+
+                process(
+                    samples.as_slice(),
+                    &mut processed_samples,
+                    &mut filters,
+                    usb_gain.0,
+                    usb_gain.1,
+                );
+            }
+            _ => {
+                debug!("Drop sample block with source {}", source);
+                continue;
+            }
+        };
+
+        write_err = sai_amp.write(&processed_samples).await.is_err();
     }
 }

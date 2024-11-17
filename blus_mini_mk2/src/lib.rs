@@ -50,6 +50,12 @@ pub const USB_MAX_SAMPLE_COUNT: usize = USB_MAX_PACKET_SIZE / SAMPLE_SIZE;
 // Buffer of around 1 ms size
 pub const SPDIF_SAMPLE_COUNT: usize = SAMPLE_SIZE_PER_MS / SAMPLE_SIZE;
 
+pub const MAX_SAMPLE_COUNT: usize = if USB_MAX_SAMPLE_COUNT > SPDIF_SAMPLE_COUNT {
+    USB_MAX_SAMPLE_COUNT
+} else {
+    SPDIF_SAMPLE_COUNT
+};
+
 // Task communication
 pub static USB_IS_STREAMING: AtomicBool = AtomicBool::new(false);
 pub static SPDIF_IS_STREAMING: AtomicBool = AtomicBool::new(false);
@@ -64,9 +70,16 @@ pub static POT_GAIN_SIGNAL: Signal<ThreadModeRawMutex, f32> = Signal::new();
 pub static AUDIO_SOURCE_SIGNAL: Signal<ThreadModeRawMutex, AudioSource> = Signal::new();
 
 // Type definitions
-pub type SpdifSampleBlock = [u32; SPDIF_SAMPLE_COUNT];
+pub const SAMPLE_BLOCK_COUNT: usize = 5;
 pub type UsbSampleBlock = Vec<u32, USB_MAX_SAMPLE_COUNT>;
+pub type SpdifSampleBlock = [u32; SPDIF_SAMPLE_COUNT];
 pub type BiquadType = biquad::DirectForm2Transposed<f32>;
+
+#[derive(Debug)]
+pub enum SampleBlock {
+    Usb(UsbSampleBlock),
+    Spdif(SpdifSampleBlock),
+}
 
 pub fn db_to_linear(db: f32) -> f32 {
     10.0_f32.powf(db / 20.0)

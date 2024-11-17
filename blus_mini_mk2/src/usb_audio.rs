@@ -2,7 +2,7 @@ use core::sync::atomic::Ordering::Relaxed;
 use defmt::{debug, panic};
 use embassy_stm32::{peripherals, usb};
 use embassy_sync::blocking_mutex::raw::NoopRawMutex;
-use embassy_sync::zerocopy_channel;
+use embassy_sync::channel;
 use embassy_usb::class::uac1::speaker;
 use embassy_usb::driver::EndpointError;
 use static_assertions;
@@ -71,7 +71,7 @@ async fn feedback_handler<'d, T: usb::Instance + 'd>(
 
 async fn stream_handler<'d, T: usb::Instance + 'd>(
     stream: &mut speaker::Stream<'d, usb::Driver<'d, T>>,
-    sender: &mut zerocopy_channel::Sender<'static, NoopRawMutex, UsbSampleBlock>,
+    sender: &mut channel::Sender<'static, NoopRawMutex, SampleBlock, SAMPLE_BLOCK_COUNT>,
 ) -> Result<(), Disconnected> {
     loop {
         let mut usb_data = [0u8; USB_MAX_PACKET_SIZE];
@@ -82,22 +82,21 @@ async fn stream_handler<'d, T: usb::Instance + 'd>(
 
         if word_count * SAMPLE_SIZE == data_size {
             // Obtain a buffer from the channel
-            if let Some(samples) = sender.try_send() {
-                samples.clear();
+            let mut samples: UsbSampleBlock = Vec::new();
 
-                for w in 0..word_count {
-                    let byte_offset = w * SAMPLE_SIZE;
-                    let sample =
-                        u32::from_le_bytes(usb_data[byte_offset..byte_offset + SAMPLE_SIZE].try_into().unwrap());
+            for w in 0..word_count {
+                let byte_offset = w * SAMPLE_SIZE;
+                let sample = u32::from_le_bytes(usb_data[byte_offset..byte_offset + SAMPLE_SIZE].try_into().unwrap());
 
-                    // Fill the sample buffer with data.
-                    samples.push(sample).unwrap();
-                }
+                // Fill the sample buffer with data.
+                samples.push(sample).unwrap();
+            }
 
-                sender.send_done();
+            if sender.try_send(SampleBlock::Usb(samples)).is_err() {
+                debug!("USB: Failed to send to channel")
             }
         } else {
-            debug!("Invalid USB buffer size of {}, skipped.", data_size);
+            debug!("USB: Invalid USB buffer size of {}, skipped", data_size);
         }
     }
 }
@@ -105,7 +104,7 @@ async fn stream_handler<'d, T: usb::Instance + 'd>(
 #[embassy_executor::task]
 pub async fn streaming_task(
     mut stream: speaker::Stream<'static, usb::Driver<'static, peripherals::USB_OTG_HS>>,
-    mut sender: zerocopy_channel::Sender<'static, NoopRawMutex, UsbSampleBlock>,
+    mut sender: channel::Sender<'static, NoopRawMutex, SampleBlock, SAMPLE_BLOCK_COUNT>,
 ) {
     loop {
         stream.wait_connection().await;
