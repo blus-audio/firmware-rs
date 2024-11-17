@@ -8,7 +8,7 @@ use embassy_time::{Duration, WithTimeout as _};
 use crate::*;
 
 #[allow(unused)]
-pub struct I2sResources {
+pub struct I2sResources<'d> {
     pub i2s: peripherals::SPI3,
 
     pub ck: peripherals::PC10,
@@ -16,11 +16,11 @@ pub struct I2sResources {
     pub ws: peripherals::PA4,
     pub mck: peripherals::PC7,
     pub dma: peripherals::DMA1_CH7,
+    pub dma_buf: &'d mut [u16],
 }
 
-fn new_i2s<'d>(resources: &'d mut I2sResources) -> i2s::I2S<'d> {
+fn new_i2s<'d>(resources: &'d mut I2sResources) -> i2s::I2S<'d, u16> {
     let mut config = i2s::Config::default();
-
     config.format = i2s::Format::Data32Channel32;
 
     i2s::I2S::new_txonly(
@@ -30,6 +30,7 @@ fn new_i2s<'d>(resources: &'d mut I2sResources) -> i2s::I2S<'d> {
         &mut resources.ck,
         &mut resources.mck,
         &mut resources.dma,
+        resources.dma_buf,
         Hertz((SAMPLE_WIDTH_BIT * INPUT_CHANNEL_COUNT * SAMPLE_RATE_HZ as usize) as u32),
         config,
     )
@@ -37,7 +38,7 @@ fn new_i2s<'d>(resources: &'d mut I2sResources) -> i2s::I2S<'d> {
 
 #[embassy_executor::task]
 pub async fn audio_routing_task(
-    mut i2s_resources: I2sResources,
+    mut i2s_resources: I2sResources<'static>,
     mut usb_audio_receiver: zerocopy_channel::Receiver<'static, NoopRawMutex, UsbSampleBlock>,
 ) {
     let mut i2s_amp = new_i2s(&mut i2s_resources);

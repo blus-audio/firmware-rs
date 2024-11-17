@@ -32,6 +32,7 @@ bind_interrupts!(struct Irqs {
 static TIMER: Mutex<CriticalSectionRawMutex, RefCell<Option<timer::low_level::Timer<peripherals::TIM2>>>> =
     Mutex::new(RefCell::new(None));
 static I2C_BUS: StaticCell<NoopMutex<RefCell<i2c::I2c<'static, Async>>>> = StaticCell::new();
+static DMA_BUFFER: StaticCell<[u16; 2 * USB_MAX_SAMPLE_COUNT]> = StaticCell::new();
 
 #[allow(unused)]
 struct AmplifierResources {
@@ -49,57 +50,17 @@ async fn amplifier_task(amplifier_resources: AmplifierResources) {
     let i2c_bus = NoopMutex::new(RefCell::new(amplifier_resources.i2c));
     let i2c_bus = I2C_BUS.init(i2c_bus);
 
-    const NOISE_GATE: Option<NoiseGate> = Some(NoiseGate {
-        hysteresis: NoiseGateHysteresis::Duration1000ms,
-        level: NoiseGateLevel::ThresholdMinus90dBFS,
-    });
-
-    const POWER_MODE: PowerMode = PowerMode::Two;
-    const AMPLIFIER_LEVEL: Gain = Gain::Gain11_0dBV;
-
     let mut ic2_device_a = I2cDevice::new(i2c_bus);
-    let mut tas2780_a = Tas2780::new(
-        &mut ic2_device_a,
-        0x39,
-        0,
-        Channel::Left,
-        AMPLIFIER_LEVEL,
-        POWER_MODE,
-        NOISE_GATE,
-    );
+    let mut tas2780_a = Tas2780::new(&mut ic2_device_a, 0x39);
 
     let mut ic2_device_b = I2cDevice::new(i2c_bus);
-    let mut tas2780_b = Tas2780::new(
-        &mut ic2_device_b,
-        0x3a,
-        1,
-        Channel::Left,
-        AMPLIFIER_LEVEL,
-        POWER_MODE,
-        NOISE_GATE,
-    );
+    let mut tas2780_b = Tas2780::new(&mut ic2_device_b, 0x3a);
 
     let mut ic2_device_c = I2cDevice::new(i2c_bus);
-    let mut tas2780_c = Tas2780::new(
-        &mut ic2_device_c,
-        0x3d,
-        2,
-        Channel::Right,
-        AMPLIFIER_LEVEL,
-        POWER_MODE,
-        NOISE_GATE,
-    );
+    let mut tas2780_c = Tas2780::new(&mut ic2_device_c, 0x3d);
 
     let mut ic2_device_d = I2cDevice::new(i2c_bus);
-    let mut tas2780_d = Tas2780::new(
-        &mut ic2_device_d,
-        0x3e,
-        3,
-        Channel::Right,
-        AMPLIFIER_LEVEL,
-        POWER_MODE,
-        NOISE_GATE,
-    );
+    let mut tas2780_d = Tas2780::new(&mut ic2_device_d, 0x3e);
 
     debug!("Reset amplifiers.");
     pin_nsd.set_low();
@@ -109,20 +70,36 @@ async fn amplifier_task(amplifier_resources: AmplifierResources) {
     // Wait for reset
     Timer::after_millis(10).await;
 
-    debug!("Initialize TAS2780");
-    for amplifier in [&mut tas2780_a, &mut tas2780_b, &mut tas2780_c, &mut tas2780_d] {
-        amplifier.init().await;
-    }
+    tas2780_a
+        .init(Config {
+            tdm_slot: 0,
+            ..Default::default()
+        })
+        .await;
+    tas2780_b
+        .init(Config {
+            tdm_slot: 1,
+            ..Default::default()
+        })
+        .await;
+    tas2780_c
+        .init(Config {
+            tdm_slot: 2,
+            ..Default::default()
+        })
+        .await;
+    tas2780_d
+        .init(Config {
+            tdm_slot: 3,
+            ..Default::default()
+        })
+        .await;
 
     loop {
-        let play = I2S_ACTIVE_SIGNAL.wait().await;
-
-        if play {
+        if I2S_ACTIVE_SIGNAL.wait().await {
             for amplifier in [&mut tas2780_a, &mut tas2780_b, &mut tas2780_c, &mut tas2780_d] {
                 amplifier.enable();
             }
-        } else {
-            // FIXME: Implement disable?
         }
     }
 }
@@ -250,6 +227,7 @@ async fn main(spawner: Spawner) {
         pin_irqz: Input::new(p.PC14, Pull::None),
     };
 
+    let dma_buffer = DMA_BUFFER.init([0x00_u16; USB_MAX_SAMPLE_COUNT * 2]);
     let i2s_resources = I2sResources {
         i2s: p.SPI3,
         ck: p.PC10,
@@ -257,6 +235,7 @@ async fn main(spawner: Spawner) {
         ws: p.PA4,
         mck: p.PC7,
         dma: p.DMA1_CH7,
+        dma_buf: dma_buffer,
     };
 
     // Establish a zero-copy channel for transferring received audio samples from the USB audio task.
@@ -271,8 +250,21 @@ async fn main(spawner: Spawner) {
     let mut tim2 = timer::low_level::Timer::new(p.TIM2);
     tim2.set_tick_freq(Hertz(FEEDBACK_COUNTER_TICK_RATE));
     tim2.set_trigger_source(timer::low_level::TriggerSource::ITR1);
-    tim2.set_slave_mode(timer::low_level::SlaveMode::TRIGGER_MODE);
-    tim2.regs_gp16().dier().modify(|r| r.set_tie(true));
+
+    const CHANNEL: timer::Channel = timer::Channel::Ch1;
+    tim2.set_input_ti_selection(CHANNEL, timer::low_level::InputTISelection::TRC);
+    tim2.set_input_capture_prescaler(CHANNEL, 0);
+    tim2.set_input_capture_filter(CHANNEL, timer::low_level::FilterValue::FCK_INT_N2);
+
+    // Reset all interrupt flags.
+    tim2.regs_gp32().sr().write(|r| r.0 = 0);
+
+    // Enable routing of SOF to the timer.
+    tim2.regs_gp32().or().write(|r| *r = 0b10 << 10);
+
+    tim2.enable_channel(CHANNEL, true);
+    tim2.enable_input_interrupt(CHANNEL, true);
+
     tim2.start();
 
     TIMER.lock(|p| p.borrow_mut().replace(tim2));
@@ -301,23 +293,23 @@ fn TIM2() {
 
     critical_section::with(|cs| {
         // Read timer counter.
-        let ticks = TIMER.borrow(cs).borrow().as_ref().unwrap().regs_gp32().cnt().read();
+        let timer = TIMER.borrow(cs).borrow().as_ref().unwrap().regs_gp32();
+
+        let status = timer.sr().read();
+
+        const CHANNEL_INDEX: usize = 0;
+        if status.ccif(CHANNEL_INDEX) {
+            let ticks = timer.ccr(CHANNEL_INDEX).read();
+
+            *FRAME_COUNT += 1;
+            if *FRAME_COUNT >= FEEDBACK_REFRESH_PERIOD.frame_count() {
+                *FRAME_COUNT = 0;
+                FEEDBACK_SIGNAL.signal(ticks.wrapping_sub(*LAST_TICKS));
+                *LAST_TICKS = ticks;
+            }
+        };
 
         // Clear trigger interrupt flag.
-        TIMER
-            .borrow(cs)
-            .borrow_mut()
-            .as_mut()
-            .unwrap()
-            .regs_gp32()
-            .sr()
-            .modify(|r| r.set_tif(false));
-
-        *FRAME_COUNT += 1;
-        if *FRAME_COUNT >= FEEDBACK_REFRESH_PERIOD.frame_count() {
-            *FRAME_COUNT = 0;
-            FEEDBACK_SIGNAL.signal(ticks.wrapping_sub(*LAST_TICKS));
-            *LAST_TICKS = ticks;
-        }
+        timer.sr().modify(|r| r.set_tif(false));
     });
 }

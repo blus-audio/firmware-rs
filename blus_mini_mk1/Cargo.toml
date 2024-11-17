@@ -47,13 +47,13 @@ embedded-io = { version = "0.6.0" }
 embedded-io-async = { version = "0.6.1" }
 panic-probe = { version = "0.3", features = ["print-defmt"] }
 heapless = { version = "0.8", default-features = false }
-critical-section = "1.1"
+critical-section = "1.2"
 embedded-storage = "0.3.1"
 micromath = "2.0.0"
 static_cell = "2"
 chrono = { version = "^0.4", default-features = false }
 grounded = "0.2.0"
-libm = "0.2.8"
+libm = "0.2"
 static_assertions = "1.1.0"
 
 # cargo build/run
