@@ -226,6 +226,23 @@ pub async fn audio_routing_task(
     sai_rpi.start().unwrap();
 
     loop {
+        let sample_block = match select(audio_receiver.receive(), sai_amp.wait_write_error()).await {
+            Either::First(x) => {
+                // Determine the next active source, if none was previously selected.
+                if matches!(source, AudioSource::None) {
+                    source = match &x {
+                        SampleBlock::Spdif(_) => AudioSource::Spdif,
+                        SampleBlock::Usb(_) => AudioSource::Usb,
+                    };
+                }
+                Some(x)
+            }
+            Either::Second(_) => {
+                source = AudioSource::None;
+                None
+            }
+        };
+
         // Reset SAI if the source changes. The source is reset to `None` in case of errors,
         // thus also resetting the SAI.
         if last_source != source {
@@ -261,21 +278,7 @@ pub async fn audio_routing_task(
             sai_rpi.start().unwrap();
         }
 
-        let sample_block = match select(audio_receiver.receive(), sai_amp.write_error()).await {
-            Either::First(x) => x,
-            Either::Second(_) => {
-                source = AudioSource::None;
-                continue;
-            }
-        };
-
-        if matches!(source, AudioSource::None) {
-            source = match &sample_block {
-                SampleBlock::Spdif(_) => AudioSource::Spdif,
-                SampleBlock::Usb(_) => AudioSource::Usb,
-            };
-            continue;
-        }
+        let Some(sample_block) = sample_block else { continue };
 
         let mut processed_samples: Vec<u32, { 2 * MAX_SAMPLE_COUNT }> = Vec::new();
         match (sample_block, source) {
