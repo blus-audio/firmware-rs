@@ -57,9 +57,6 @@ pub const MAX_SAMPLE_COUNT: usize = if USB_MAX_SAMPLE_COUNT > SPDIF_SAMPLE_COUNT
 };
 
 // Task communication
-pub static USB_IS_STREAMING: AtomicBool = AtomicBool::new(false);
-pub static SPDIF_IS_STREAMING: AtomicBool = AtomicBool::new(false);
-
 pub static FEEDBACK_SIGNAL: Signal<CriticalSectionRawMutex, u32> = Signal::new();
 pub static SAI_ACTIVE_SIGNAL: Signal<ThreadModeRawMutex, AudioSource> = Signal::new();
 pub static AMP_SETUP_SIGNAL: Signal<ThreadModeRawMutex, bool> = Signal::new();

@@ -5,7 +5,7 @@ pub mod tas2780;
 
 use micromath::F32Ext;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, defmt::Format)]
+#[derive(Clone, Copy, PartialEq, Debug, defmt::Format)]
 pub enum AudioSource {
     None,
     Usb,

@@ -322,26 +322,22 @@ async fn spdif_task(
 
     loop {
         let mut data = [0u32; SPDIF_SAMPLE_COUNT];
-        let timeout_result = spdif.read(&mut data).with_timeout(Duration::from_millis(100)).await;
+        let result = spdif.read(&mut data).await;
 
-        SPDIF_IS_STREAMING.store(timeout_result.is_ok(), Relaxed);
-
-        if let Ok(read_result) = timeout_result {
-            match read_result {
-                Ok(_) => {
-                    if sender.try_send(SampleBlock::Spdif(data)).is_err() {
-                        debug!("SPDIF: Failed to send to channel")
-                    }
+        match result {
+            Ok(_) => {
+                if sender.try_send(SampleBlock::Spdif(data)).is_err() {
+                    debug!("SPDIF: Failed to send to channel")
                 }
-                Err(spdifrx::Error::RingbufferError(_)) => {
-                    debug!("SPDIF ringbuffer error");
-                    drop(spdif);
-                    spdif = new_spdif(&mut resources, buffer);
-                    spdif.start();
-                }
-                _ => (),
-            };
-        }
+            }
+            Err(spdifrx::Error::RingbufferError(_)) => {
+                debug!("SPDIF ringbuffer error");
+                drop(spdif);
+                spdif = new_spdif(&mut resources, buffer);
+                spdif.start();
+            }
+            _ => (),
+        };
     }
 }
 

@@ -1,12 +1,13 @@
 use audio::{audio_filter, AudioFilter};
 use core::sync::atomic::Ordering::Relaxed;
 use defmt::{debug, info, panic};
+use embassy_futures::select::{select, Either, Select};
 use embassy_stm32::gpio::Output;
 use embassy_stm32::sai::word;
 use embassy_stm32::{peripherals, sai};
 use embassy_sync::blocking_mutex::raw::NoopRawMutex;
 use embassy_sync::channel;
-use embassy_time::{Duration, WithTimeout};
+use embassy_time::{Duration, Instant, WithTimeout};
 use grounded::uninit::GroundedArrayCell;
 use static_assertions;
 
@@ -216,8 +217,6 @@ pub async fn audio_routing_task(
         AudioSource::None,
     );
 
-    let mut write_err = false;
-
     let mut source = AudioSource::None;
     let mut last_source = source;
 
@@ -227,31 +226,11 @@ pub async fn audio_routing_task(
     sai_rpi.start().unwrap();
 
     loop {
-        for led in [&mut led_usb, &mut led_rpi, &mut led_spdif, &mut led_status] {
+        for led in [&mut led_usb, &mut led_rpi, &mut led_spdif] {
             led.set_low();
         }
 
-        let rpi_is_streaming = false; // !sai_rpi.is_muted().unwrap();
-
-        // Source prioritization is determined by the order of checks.
-        source = if write_err {
-            write_err = false;
-            AudioSource::None
-        } else if rpi_is_streaming {
-            led_rpi.set_high();
-            AudioSource::RaspberryPi
-        } else if USB_IS_STREAMING.load(Relaxed) {
-            led_usb.set_high();
-            AudioSource::Usb
-        } else if SPDIF_IS_STREAMING.load(Relaxed) {
-            led_spdif.set_high();
-            AudioSource::Spdif
-        } else {
-            AudioSource::None
-        };
-
-        let source_changed = last_source != source;
-        if source_changed {
+        if last_source != source {
             info!("New source: {}", source);
             last_source = source;
 
@@ -273,15 +252,32 @@ pub async fn audio_routing_task(
             sai_rpi.start().unwrap();
         }
 
-        let Ok(sample_block) = audio_receiver.receive().with_timeout(Duration::from_millis(10)).await else {
-            sai_amp.set_mute(true);
-            continue;
+        let channel_receive_fut = audio_receiver.receive().with_timeout(Duration::from_secs(1));
+        let sai_error_fut = sai_amp.write_error();
+
+        let sample_block = match select(channel_receive_fut, sai_error_fut).await {
+            Either::First(timeout_result) => match timeout_result {
+                Ok(sample_block) => sample_block,
+                Err(_) => {
+                    source = AudioSource::None;
+                    continue;
+                }
+            },
+            Either::Second(_) => {
+                source = AudioSource::None;
+                continue;
+            }
         };
 
-        led_status.set_high();
+        if matches!(source, AudioSource::None) {
+            source = match &sample_block {
+                SampleBlock::Spdif(_) => AudioSource::Spdif,
+                SampleBlock::Usb(_) => AudioSource::Usb,
+            };
+            continue;
+        }
 
         let mut processed_samples: Vec<u32, { 2 * MAX_SAMPLE_COUNT }> = Vec::new();
-
         match (sample_block, source) {
             (SampleBlock::Spdif(samples), AudioSource::Spdif) => {
                 if let Some(gain) = POT_GAIN_SIGNAL.try_take() {
@@ -320,6 +316,8 @@ pub async fn audio_routing_task(
             }
         };
 
-        write_err = sai_amp.write(&processed_samples).await.is_err();
+        if sai_amp.write(&processed_samples).await.is_err() {
+            source = AudioSource::None;
+        }
     }
 }
