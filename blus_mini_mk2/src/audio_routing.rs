@@ -226,13 +226,22 @@ pub async fn audio_routing_task(
     sai_rpi.start().unwrap();
 
     loop {
-        for led in [&mut led_usb, &mut led_rpi, &mut led_spdif] {
-            led.set_low();
-        }
-
+        // Reset SAI if the source changes. The source is reset to `None` in case of errors,
+        // thus also resetting the SAI.
         if last_source != source {
             info!("New source: {}", source);
             last_source = source;
+
+            for led in [&mut led_usb, &mut led_rpi, &mut led_spdif] {
+                led.set_low();
+            }
+
+            match source {
+                AudioSource::Spdif => led_spdif.set_high(),
+                AudioSource::Usb => led_usb.set_high(),
+                AudioSource::RaspberryPi => led_rpi.set_high(),
+                _ => (),
+            }
 
             drop(sai_amp);
             drop(sai_rpi);
@@ -252,17 +261,8 @@ pub async fn audio_routing_task(
             sai_rpi.start().unwrap();
         }
 
-        let channel_receive_fut = audio_receiver.receive().with_timeout(Duration::from_secs(1));
-        let sai_error_fut = sai_amp.write_error();
-
-        let sample_block = match select(channel_receive_fut, sai_error_fut).await {
-            Either::First(timeout_result) => match timeout_result {
-                Ok(sample_block) => sample_block,
-                Err(_) => {
-                    source = AudioSource::None;
-                    continue;
-                }
-            },
+        let sample_block = match select(audio_receiver.receive(), sai_amp.write_error()).await {
+            Either::First(x) => x,
             Either::Second(_) => {
                 source = AudioSource::None;
                 continue;
@@ -316,8 +316,6 @@ pub async fn audio_routing_task(
             }
         };
 
-        if sai_amp.write(&processed_samples).await.is_err() {
-            source = AudioSource::None;
-        }
+        sai_amp.write(&processed_samples).await.unwrap();
     }
 }
