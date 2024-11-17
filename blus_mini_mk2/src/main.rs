@@ -67,7 +67,7 @@ struct SpdifResources {
     dma: peripherals::DMA1_CH1,
 }
 
-pub fn get_filters() -> [AudioFilter<'static>; OUTPUT_CHANNEL_COUNT] {
+pub fn get_filters(sample_rate_hz: u32) -> [AudioFilter<'static>; OUTPUT_CHANNEL_COUNT] {
     use biquad::*;
 
     type B = BiquadType;
@@ -76,7 +76,7 @@ pub fn get_filters() -> [AudioFilter<'static>; OUTPUT_CHANNEL_COUNT] {
     // Crossover frequency
     let f_co = 1800.hz();
 
-    let fs = SAMPLE_RATE_HZ.hz();
+    let fs = sample_rate_hz.hz();
 
     static BIQUADS_A: StaticCell<[B; 9]> = StaticCell::new();
     static BIQUADS_C: StaticCell<[B; 9]> = StaticCell::new();
@@ -591,7 +591,7 @@ async fn main(spawner: Spawner) {
 
     // Launch audio routing.
     unwrap!(spawner.spawn(audio_routing::audio_routing_task(
-        get_filters(),
+        get_filters(SAMPLE_RATE_HZ),
         sai4_resources,
         audio_channel.receiver(),
         led_blue,
