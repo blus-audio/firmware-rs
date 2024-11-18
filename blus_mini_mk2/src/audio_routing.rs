@@ -1,6 +1,6 @@
 use audio::{audio_filter, AudioFilter};
 use defmt::{debug, info, panic};
-use embassy_futures::select::{select, Either};
+use embassy_futures::select::{select3, Either3};
 use embassy_stm32::gpio::Output;
 use embassy_stm32::sai::word;
 use embassy_stm32::{peripherals, sai};
@@ -207,7 +207,7 @@ pub async fn audio_routing_task(
     };
 
     let mut source = AudioSource::None;
-    let mut new_source = AudioSource::None;
+    let mut new_source: AudioSource;
 
     let (mut sai_amp, mut sai_rpi) = new_sai_amp_rpi(
         &mut sai4_resources,
@@ -223,21 +223,32 @@ pub async fn audio_routing_task(
     sai_rpi.start().unwrap();
 
     loop {
-        let sample_block = match select(audio_receiver.receive(), sai_amp.wait_write_error()).await {
-            Either::First(sample_block) => {
-                // Determine the next active source, if none was previously selected.
-                if matches!(source, AudioSource::None) {
-                    new_source = match &sample_block {
-                        SampleBlock::Spdif(_) => AudioSource::Spdif,
-                        SampleBlock::Usb(_) => AudioSource::Usb,
-                    };
+        let mut rpi_data = [0u32; RPI_SAMPLE_COUNT];
+
+        let sample_block = match select3(
+            audio_receiver.receive(),
+            sai_amp.wait_write_error(),
+            sai_rpi.read(&mut rpi_data),
+        )
+        .await
+        {
+            Either3::First(sample_block) => Some(sample_block),
+            Either3::Second(_) => None,
+            Either3::Third(_) => {
+                if !sai_rpi.is_muted().unwrap() {
+                    Some(SampleBlock::Rpi(rpi_data))
+                } else {
+                    None
                 }
-                Some(sample_block)
             }
-            Either::Second(_) => {
-                new_source = AudioSource::None;
-                None
-            }
+        };
+
+        new_source = match (&sample_block, source) {
+            (Some(SampleBlock::Spdif(_)), AudioSource::None) => AudioSource::Spdif,
+            (Some(SampleBlock::Usb(_)), AudioSource::None) => AudioSource::Usb,
+            (Some(SampleBlock::Rpi(_)), AudioSource::None) => AudioSource::Rpi,
+            (None, _) => AudioSource::None,
+            _ => source,
         };
 
         // Reset SAI if the source changes.
@@ -253,7 +264,7 @@ pub async fn audio_routing_task(
             match source {
                 AudioSource::Spdif => led_spdif.set_high(),
                 AudioSource::Usb => led_usb.set_high(),
-                AudioSource::RaspberryPi => led_rpi.set_high(),
+                AudioSource::Rpi => led_rpi.set_high(),
                 _ => (),
             }
 
@@ -317,8 +328,7 @@ pub async fn audio_routing_task(
             }
         };
 
-        if sai_amp.write(&processed_samples).await.is_err() {
-            new_source = AudioSource::None;
-        }
+        // Ignore errors here, `wait_write_error()` will catch them in the next loop iteration.
+        _ = sai_amp.write(&processed_samples).await;
     }
 }

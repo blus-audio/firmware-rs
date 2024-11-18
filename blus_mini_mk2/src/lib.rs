@@ -48,6 +48,7 @@ pub const USB_MAX_SAMPLE_COUNT: usize = USB_MAX_PACKET_SIZE / SAMPLE_SIZE;
 
 // Buffer of around 1 ms size
 pub const SPDIF_SAMPLE_COUNT: usize = SAMPLE_SIZE_PER_MS / SAMPLE_SIZE;
+pub const RPI_SAMPLE_COUNT: usize = SAMPLE_SIZE_PER_MS / SAMPLE_SIZE;
 
 pub const MAX_SAMPLE_COUNT: usize = if USB_MAX_SAMPLE_COUNT > SPDIF_SAMPLE_COUNT {
     USB_MAX_SAMPLE_COUNT
@@ -69,12 +70,15 @@ pub static AUDIO_SOURCE_SIGNAL: Signal<ThreadModeRawMutex, AudioSource> = Signal
 pub const SAMPLE_BLOCK_COUNT: usize = 5;
 pub type UsbSampleBlock = Vec<u32, USB_MAX_SAMPLE_COUNT>;
 pub type SpdifSampleBlock = [u32; SPDIF_SAMPLE_COUNT];
+pub type RpiSampleBlock = [u32; RPI_SAMPLE_COUNT];
+
 pub type BiquadType = biquad::DirectForm2Transposed<f32>;
 
 #[derive(Debug)]
 pub enum SampleBlock {
     Usb(UsbSampleBlock),
     Spdif(SpdifSampleBlock),
+    Rpi(RpiSampleBlock),
 }
 
 pub fn db_to_linear(db: f32) -> f32 {

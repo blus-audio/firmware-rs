@@ -11,7 +11,7 @@ pub enum AudioSource {
     Usb,
     Spdif,
     Ext,
-    RaspberryPi,
+    Rpi,
 }
 
 pub type BiquadType = biquad::DirectForm2Transposed<f32>;
