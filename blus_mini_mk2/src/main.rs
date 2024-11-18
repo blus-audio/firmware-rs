@@ -5,7 +5,6 @@ use core::cell::RefCell;
 
 use audio::{self, AudioFilter, AudioSource};
 use blus_fw::*;
-use core::sync::atomic::Ordering::Relaxed;
 use defmt::{debug, info, unwrap};
 use embassy_embedded_hal::shared_bus::blocking::i2c::I2cDevice;
 use embassy_executor::Spawner;
@@ -18,7 +17,7 @@ use embassy_stm32::{bind_interrupts, i2c, interrupt, peripherals, timer, usb};
 use embassy_sync::blocking_mutex::raw::{CriticalSectionRawMutex, NoopRawMutex};
 use embassy_sync::blocking_mutex::{Mutex, NoopMutex};
 use embassy_sync::channel;
-use embassy_time::{Duration, Ticker, Timer, WithTimeout};
+use embassy_time::{Duration, Ticker, Timer};
 use embassy_usb::class::uac1;
 use embassy_usb::class::uac1::speaker::{self, Speaker};
 use grounded::uninit::GroundedArrayCell;
@@ -593,7 +592,6 @@ async fn main(spawner: Spawner) {
         led_blue,
         led_red,
         led_yellow,
-        led_green
     )));
 
     // Launch USB audio tasks.

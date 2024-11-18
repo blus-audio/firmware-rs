@@ -1,13 +1,11 @@
 use audio::{audio_filter, AudioFilter};
-use core::sync::atomic::Ordering::Relaxed;
 use defmt::{debug, info, panic};
-use embassy_futures::select::{select, Either, Select};
+use embassy_futures::select::{select, Either};
 use embassy_stm32::gpio::Output;
 use embassy_stm32::sai::word;
 use embassy_stm32::{peripherals, sai};
 use embassy_sync::blocking_mutex::raw::NoopRawMutex;
 use embassy_sync::channel;
-use embassy_time::{Duration, Instant, WithTimeout};
 use grounded::uninit::GroundedArrayCell;
 use static_assertions;
 
@@ -189,7 +187,6 @@ pub async fn audio_routing_task(
     mut filters: [AudioFilter<'static>; OUTPUT_CHANNEL_COUNT],
     mut sai4_resources: Sai4Resources,
     audio_receiver: channel::Receiver<'static, NoopRawMutex, SampleBlock, SAMPLE_BLOCK_COUNT>,
-    mut led_status: Output<'static>,
     mut led_usb: Output<'static>,
     mut led_rpi: Output<'static>,
     mut led_spdif: Output<'static>,
@@ -218,7 +215,7 @@ pub async fn audio_routing_task(
     );
 
     let mut source = AudioSource::None;
-    let mut last_source = source;
+    let mut new_source = AudioSource::None;
 
     let mut usb_gain = (0.0, 0.0);
     let mut pot_gain = (0.0, 0.0);
@@ -227,27 +224,27 @@ pub async fn audio_routing_task(
 
     loop {
         let sample_block = match select(audio_receiver.receive(), sai_amp.wait_write_error()).await {
-            Either::First(x) => {
+            Either::First(sample_block) => {
                 // Determine the next active source, if none was previously selected.
                 if matches!(source, AudioSource::None) {
-                    source = match &x {
+                    new_source = match &sample_block {
                         SampleBlock::Spdif(_) => AudioSource::Spdif,
                         SampleBlock::Usb(_) => AudioSource::Usb,
                     };
                 }
-                Some(x)
+                Some(sample_block)
             }
             Either::Second(_) => {
-                source = AudioSource::None;
+                new_source = AudioSource::None;
                 None
             }
         };
 
-        // Reset SAI if the source changes. The source is reset to `None` in case of errors,
-        // thus also resetting the SAI.
-        if last_source != source {
-            info!("New source: {}", source);
-            last_source = source;
+        // Reset SAI if the source changes.
+        // The source is reset to `None` in case of errors, thus also resetting the SAI.
+        if source != new_source {
+            info!("New source: {}", new_source);
+            source = new_source;
 
             for led in [&mut led_usb, &mut led_rpi, &mut led_spdif] {
                 led.set_low();
@@ -278,6 +275,7 @@ pub async fn audio_routing_task(
             sai_rpi.start().unwrap();
         }
 
+        // Only process/play, if a sample block was received.
         let Some(sample_block) = sample_block else { continue };
 
         let mut processed_samples: Vec<u32, { 2 * MAX_SAMPLE_COUNT }> = Vec::new();
@@ -319,6 +317,8 @@ pub async fn audio_routing_task(
             }
         };
 
-        sai_amp.write(&processed_samples).await.unwrap();
+        if sai_amp.write(&processed_samples).await.is_err() {
+            new_source = AudioSource::None;
+        }
     }
 }

@@ -3,7 +3,6 @@
 pub mod audio_routing;
 pub mod usb_audio;
 
-use core::sync::atomic::AtomicBool;
 use micromath::F32Ext;
 
 use audio::AudioSource;

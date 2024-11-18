@@ -1,4 +1,3 @@
-use core::sync::atomic::Ordering::Relaxed;
 use defmt::{debug, panic};
 use embassy_stm32::{peripherals, usb};
 use embassy_sync::blocking_mutex::raw::NoopRawMutex;
