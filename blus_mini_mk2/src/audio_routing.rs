@@ -206,16 +206,16 @@ pub async fn audio_routing_task(
         core::slice::from_raw_parts_mut(ptr, len)
     };
 
+    let mut source = AudioSource::None;
+    let mut new_source = AudioSource::None;
+
     let (mut sai_amp, mut sai_rpi) = new_sai_amp_rpi(
         &mut sai4_resources,
         sai_amp_write_buffer,
         sai_rpi_read_buffer,
         SAMPLE_RATE_HZ,
-        AudioSource::None,
+        source,
     );
-
-    let mut source = AudioSource::None;
-    let mut new_source = AudioSource::None;
 
     let mut usb_gain = (0.0, 0.0);
     let mut pot_gain = (0.0, 0.0);
