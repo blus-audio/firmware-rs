@@ -1,5 +1,5 @@
 use audio::{audio_filter, AudioFilter};
-use defmt::{debug, info, panic};
+use defmt::{debug, info, panic, trace};
 use embassy_futures::select::{select3, Either3};
 use embassy_stm32::gpio::Output;
 use embassy_stm32::sai::word;
@@ -254,13 +254,13 @@ pub async fn audio_routing_task(
         // Reset SAI if the source changes.
         // The source is reset to `None` in case of errors, thus also resetting the SAI.
         if source != new_source {
-            info!("New source: {}", new_source);
             source = new_source;
 
             for led in [&mut led_usb, &mut led_rpi, &mut led_spdif] {
                 led.set_low();
             }
 
+            info!("New source: {}", new_source);
             match source {
                 AudioSource::Spdif => led_spdif.set_high(),
                 AudioSource::Usb => led_usb.set_high(),
@@ -323,12 +323,14 @@ pub async fn audio_routing_task(
                 );
             }
             _ => {
-                debug!("Drop sample block with source {}", source);
+                trace!("Drop sample block with source {}", source);
                 continue;
             }
         };
 
         // Ignore errors here, `wait_write_error()` will catch them in the next loop iteration.
-        _ = sai_amp.write(&processed_samples).await;
+        if sai_amp.write(&processed_samples).await.is_err() {
+            debug!("Spurious SAI write error");
+        };
     }
 }
