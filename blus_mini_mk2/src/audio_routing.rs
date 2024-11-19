@@ -1,6 +1,5 @@
 use audio::{audio_filter, AudioFilter};
 use defmt::{debug, info, panic, trace};
-use embassy_futures::join;
 use embassy_futures::select::{select, select3, Either, Either3};
 use embassy_stm32::gpio::Output;
 use embassy_stm32::sai::word;

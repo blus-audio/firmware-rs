@@ -11,7 +11,7 @@ default = []
 
 [dependencies]
 audio = { path = "../audio" }
-biquad = { version = "0.4.2" }
+biquad = { version = "0.4" }
 embassy-stm32 = { path = "../embassy/embassy-stm32", features = [
     "defmt",
     "stm32h723vg",
@@ -42,28 +42,26 @@ embassy-futures = { path = "../embassy/embassy-futures" }
 defmt = "0.3"
 defmt-rtt = "0.4"
 
-cortex-m = { version = "0.7.6", features = [
+cortex-m = { version = "0.7", features = [
     "inline-asm",
     "critical-section-single-core",
 ] }
-cortex-m-rt = "0.7.0"
-embedded-hal = "0.2.6"
-embedded-hal-1 = { package = "embedded-hal", version = "1.0" }
+cortex-m-rt = "0.7"
+embedded-hal = { package = "embedded-hal", version = "1.0" }
 embedded-hal-async = { version = "1.0" }
-embedded-nal-async = { version = "0.7.1" }
-embedded-io-async = { version = "0.6.1" }
+embedded-nal-async = { version = "0.8" }
+embedded-io-async = { version = "0.6" }
 panic-probe = { version = "0.3", features = ["print-defmt"] }
 heapless = { version = "0.8", default-features = false }
-rand_core = "0.6.3"
+rand_core = "0.6"
 critical-section = "1.1"
-micromath = "2.0.0"
-stm32-fmc = "0.3.0"
-embedded-storage = "0.3.1"
+micromath = "2.0"
+stm32-fmc = "0.3"
+embedded-storage = "0.3"
 static_cell = "2"
-chrono = { version = "^0.4", default-features = false }
-grounded = "0.2.0"
-libm = "0.2.8"
-static_assertions = "1.1.0"
+chrono = { version = "0.4", default-features = false }
+grounded = "0.2"
+static_assertions = "1"
 
 # cargo build/run
 [profile.dev]
