@@ -286,7 +286,7 @@ pub async fn audio_routing_task(
             sai_rpi.start().unwrap();
         }
 
-        // Only process/play, if a sample block was received.
+        // Only process/play, if `Some` sample block was received.
         let Some(sample_block) = sample_block else { continue };
 
         let mut processed_samples: Vec<u32, { 2 * MAX_SAMPLE_COUNT }> = Vec::new();
