@@ -43,7 +43,7 @@ static mut ADC1_MEASUREMENT_BUFFER: GroundedArrayCell<u16, 1> = GroundedArrayCel
 // Reserve twice the SPDIF sample count, since the DMA will transfer at
 // half-full interrupt (so, at SPDIF_SAMPLE_COUNT * 2 / 2).
 #[link_section = ".sram1"]
-static mut SPDIFRX_BUFFER: GroundedArrayCell<u32, { SPDIF_SAMPLE_COUNT * 2 }> = GroundedArrayCell::uninit();
+static mut SPDIFRX_BUFFER: GroundedArrayCell<u32, { DEFAULT_SAMPLE_COUNT * 2 }> = GroundedArrayCell::uninit();
 
 #[allow(unused)]
 struct AmplifierResources {
@@ -295,7 +295,7 @@ async fn potentiometer_task(mut adc_resources: AdcResources<peripherals::ADC1>) 
 #[embassy_executor::task]
 async fn spdif_task(
     mut resources: SpdifResources,
-    sender: channel::Sender<'static, NoopRawMutex, SampleBlock, SAMPLE_BLOCK_COUNT>,
+    audio_channel: channel::Sender<'static, NoopRawMutex, SampleBlock, SAMPLE_BLOCK_COUNT>,
 ) {
     let buffer: &mut [u32] = unsafe {
         SPDIFRX_BUFFER.initialize_all_copied(0);
@@ -320,12 +320,12 @@ async fn spdif_task(
     spdif.start();
 
     loop {
-        let mut data = [0u32; SPDIF_SAMPLE_COUNT];
+        let mut data = [0u32; DEFAULT_SAMPLE_COUNT];
         let result = spdif.read(&mut data).await;
 
         match result {
             Ok(_) => {
-                if sender.try_send(SampleBlock::Spdif(data)).is_err() {
+                if audio_channel.try_send(SampleBlock::Spdif(data)).is_err() {
                     debug!("SPDIF: Failed to send to channel")
                 }
             }

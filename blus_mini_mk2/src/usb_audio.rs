@@ -70,7 +70,7 @@ async fn feedback_handler<'d, T: usb::Instance + 'd>(
 
 async fn stream_handler<'d, T: usb::Instance + 'd>(
     stream: &mut speaker::Stream<'d, usb::Driver<'d, T>>,
-    sender: &mut channel::Sender<'static, NoopRawMutex, SampleBlock, SAMPLE_BLOCK_COUNT>,
+    audio_channel_sender: &mut channel::Sender<'static, NoopRawMutex, SampleBlock, SAMPLE_BLOCK_COUNT>,
 ) -> Result<(), Disconnected> {
     loop {
         let mut usb_data = [0u8; USB_MAX_PACKET_SIZE];
@@ -90,7 +90,7 @@ async fn stream_handler<'d, T: usb::Instance + 'd>(
                 samples.push(sample).unwrap();
             }
 
-            if sender.try_send(SampleBlock::Usb(samples)).is_err() {
+            if audio_channel_sender.try_send(SampleBlock::Usb(samples)).is_err() {
                 debug!("USB: Failed to send to channel")
             }
         } else {
@@ -102,11 +102,11 @@ async fn stream_handler<'d, T: usb::Instance + 'd>(
 #[embassy_executor::task]
 pub async fn streaming_task(
     mut stream: speaker::Stream<'static, usb::Driver<'static, peripherals::USB_OTG_HS>>,
-    mut sender: channel::Sender<'static, NoopRawMutex, SampleBlock, SAMPLE_BLOCK_COUNT>,
+    mut audio_channel: channel::Sender<'static, NoopRawMutex, SampleBlock, SAMPLE_BLOCK_COUNT>,
 ) {
     loop {
         stream.wait_connection().await;
-        _ = stream_handler(&mut stream, &mut sender).await;
+        _ = stream_handler(&mut stream, &mut audio_channel).await;
     }
 }
 

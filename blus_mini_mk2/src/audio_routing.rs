@@ -1,26 +1,18 @@
 use audio::{audio_filter, AudioFilter};
 use defmt::{debug, info, panic, trace};
-use embassy_futures::select::{select3, Either3};
+use embassy_futures::join;
+use embassy_futures::select::{select, select3, Either, Either3};
 use embassy_stm32::gpio::Output;
 use embassy_stm32::sai::word;
 use embassy_stm32::{peripherals, sai};
 use embassy_sync::blocking_mutex::raw::NoopRawMutex;
 use embassy_sync::channel;
 use grounded::uninit::GroundedArrayCell;
-use static_assertions;
 
 use crate::*;
 
-// Generous sample buffer
-const SAI_AMP_SAMPLE_COUNT: usize = 2 * (OUTPUT_CHANNEL_COUNT / INPUT_CHANNEL_COUNT) * MAX_SAMPLE_COUNT;
-
-// Buffer of around 1 ms size
-const SAI_RPI_SAMPLE_COUNT: usize = SAMPLE_SIZE_PER_S.div_ceil(1000) / SAMPLE_SIZE;
-
-// Do not exceed the write buffer (after processing) with samples from the Raspberry Pi.
-static_assertions::const_assert!(
-    (OUTPUT_CHANNEL_COUNT / INPUT_CHANNEL_COUNT) * SAI_RPI_SAMPLE_COUNT <= SAI_AMP_SAMPLE_COUNT
-);
+// Sample buffer for writing to the amplifier SAI
+const SAI_AMP_SAMPLE_COUNT: usize = (OUTPUT_CHANNEL_COUNT / INPUT_CHANNEL_COUNT) * MAX_SAMPLE_COUNT;
 
 #[allow(unused)]
 pub struct Sai1Resources {
@@ -57,7 +49,7 @@ pub struct Sai4Resources {
 static mut SAI_AMP_WRITE_BUFFER: GroundedArrayCell<u32, SAI_AMP_SAMPLE_COUNT> = GroundedArrayCell::uninit();
 
 #[link_section = ".sram4"]
-static mut SAI_RPI_READ_BUFFER: GroundedArrayCell<u32, SAI_RPI_SAMPLE_COUNT> = GroundedArrayCell::uninit();
+static mut SAI_RPI_READ_BUFFER: GroundedArrayCell<u32, DEFAULT_SAMPLE_COUNT> = GroundedArrayCell::uninit();
 
 fn new_sai_amp_rpi<'d>(
     resources: &'d mut Sai4Resources,
@@ -186,13 +178,13 @@ fn process(
 pub async fn audio_routing_task(
     mut filters: [AudioFilter<'static>; OUTPUT_CHANNEL_COUNT],
     mut sai4_resources: Sai4Resources,
-    audio_receiver: channel::Receiver<'static, NoopRawMutex, SampleBlock, SAMPLE_BLOCK_COUNT>,
+    audio_channel: channel::Receiver<'static, NoopRawMutex, SampleBlock, SAMPLE_BLOCK_COUNT>,
     mut led_usb: Output<'static>,
     mut led_rpi: Output<'static>,
     mut led_spdif: Output<'static>,
 ) {
-    info!("Amplifier SAI write buffer size: {} samples", SAI_AMP_SAMPLE_COUNT);
-    info!("Raspberry Pi SAI read buffer size: {} samples", SAI_RPI_SAMPLE_COUNT);
+    info!("Amplifier SAI write buffer: {} samples", SAI_AMP_SAMPLE_COUNT);
+    info!("Default SAI read buffer: {} samples", DEFAULT_SAMPLE_COUNT);
 
     let sai_amp_write_buffer: &mut [u32] = unsafe {
         SAI_AMP_WRITE_BUFFER.initialize_all_copied(0);
@@ -223,23 +215,32 @@ pub async fn audio_routing_task(
     sai_rpi.start().unwrap();
 
     loop {
-        let mut rpi_data = [0u32; RPI_SAMPLE_COUNT];
+        // Get `Some` sample block from the Raspberry Pi header or audio channel, or `None`,
+        // in case of errors when writing to the amplifier SAI.
+        let sample_block = {
+            let sai_rpi_read_fut = async {
+                let mut rpi_data = [0u32; DEFAULT_SAMPLE_COUNT];
+                let read_error = sai_rpi.read(&mut rpi_data).await.is_err();
 
-        let sample_block = match select3(
-            audio_receiver.receive(),
-            sai_amp.wait_write_error(),
-            sai_rpi.read(&mut rpi_data),
-        )
-        .await
-        {
-            Either3::First(sample_block) => Some(sample_block),
-            Either3::Second(_) => None,
-            Either3::Third(_) => {
-                if !sai_rpi.is_muted().unwrap() {
-                    Some(SampleBlock::Rpi(rpi_data))
-                } else {
+                if sai_rpi.is_muted().unwrap() || read_error {
                     None
+                } else {
+                    Some(SampleBlock::Rpi(rpi_data))
                 }
+            };
+            let audio_channel_receive_fut = async { Some(audio_channel.receive().await) };
+            let sai_write_error_fut = sai_amp.wait_write_error();
+
+            match source {
+                AudioSource::Rpi => match select(sai_rpi_read_fut, sai_write_error_fut).await {
+                    Either::First(sample_block) => sample_block,
+                    Either::Second(_) => None,
+                },
+                _ => match select3(audio_channel_receive_fut, sai_rpi_read_fut, sai_write_error_fut).await {
+                    Either3::First(sample_block) => sample_block,
+                    Either3::Second(sample_block) => sample_block,
+                    Either3::Third(_) => None,
+                },
             }
         };
 
@@ -260,7 +261,7 @@ pub async fn audio_routing_task(
                 led.set_low();
             }
 
-            info!("New source: {}", new_source);
+            info!("New source: {}", source);
             match source {
                 AudioSource::Spdif => led_spdif.set_high(),
                 AudioSource::Usb => led_usb.set_high(),
@@ -282,7 +283,7 @@ pub async fn audio_routing_task(
             SAI_ACTIVE_SIGNAL.signal(source);
             AMP_SETUP_SIGNAL.wait().await;
 
-            audio_receiver.clear();
+            audio_channel.clear();
             sai_rpi.start().unwrap();
         }
 
@@ -321,6 +322,9 @@ pub async fn audio_routing_task(
                     usb_gain.0,
                     usb_gain.1,
                 );
+            }
+            (SampleBlock::Rpi(samples), AudioSource::Rpi) => {
+                process(samples.as_slice(), &mut processed_samples, &mut filters, 1.0, 1.0);
             }
             _ => {
                 trace!("Drop sample block with source {}", source);
