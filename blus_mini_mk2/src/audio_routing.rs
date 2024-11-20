@@ -1,3 +1,4 @@
+//! Audio routing (source selection), signal processing, and playback module.
 use audio::{audio_filter, AudioFilter};
 use defmt::{debug, info, panic, trace};
 use embassy_futures::select::{select, select3, Either, Either3};
@@ -13,7 +14,8 @@ use crate::*;
 // Sample buffer for writing to the amplifier SAI
 const SAI_AMP_SAMPLE_COUNT: usize = (OUTPUT_CHANNEL_COUNT / INPUT_CHANNEL_COUNT) * MAX_SAMPLE_COUNT;
 
-#[allow(unused)]
+/// Resources that are required for instantiating SAI1.
+#[allow(missing_docs)]
 pub struct Sai1Resources {
     pub sai: peripherals::SAI1,
 
@@ -27,7 +29,8 @@ pub struct Sai1Resources {
     pub dma_b: peripherals::DMA1_CH4,
 }
 
-#[allow(unused)]
+/// Resources that are required for instantiating SAI4.
+#[allow(missing_docs)]
 pub struct Sai4Resources {
     pub sai: peripherals::SAI4,
 
@@ -173,6 +176,12 @@ fn process(
     }
 }
 
+/// The task that performs audio playback.
+///
+/// Includes:
+/// - Source selection (USB, S/PDIF, Raspberry Pi, external)
+/// - Signal processing
+/// - Playback on SAI
 #[embassy_executor::task]
 pub async fn audio_routing_task(
     mut filters: [AudioFilter<'static>; OUTPUT_CHANNEL_COUNT],
@@ -182,8 +191,8 @@ pub async fn audio_routing_task(
     mut led_rpi: Output<'static>,
     mut led_spdif: Output<'static>,
 ) {
-    info!("Amplifier SAI write buffer: {} samples", SAI_AMP_SAMPLE_COUNT);
-    info!("Default SAI read buffer: {} samples", DEFAULT_SAMPLE_COUNT);
+    debug!("Amplifier SAI write buffer: {} samples", SAI_AMP_SAMPLE_COUNT);
+    debug!("Default SAI read buffer: {} samples", DEFAULT_SAMPLE_COUNT);
 
     let sai_amp_write_buffer: &mut [u32] = unsafe {
         SAI_AMP_WRITE_BUFFER.initialize_all_copied(0);
@@ -256,18 +265,6 @@ pub async fn audio_routing_task(
         if source != new_source {
             source = new_source;
 
-            for led in [&mut led_usb, &mut led_rpi, &mut led_spdif] {
-                led.set_low();
-            }
-
-            info!("New source: {}", source);
-            match source {
-                AudioSource::Spdif => led_spdif.set_high(),
-                AudioSource::Usb => led_usb.set_high(),
-                AudioSource::Rpi => led_rpi.set_high(),
-                _ => (),
-            }
-
             drop(sai_amp);
             drop(sai_rpi);
 
@@ -281,6 +278,18 @@ pub async fn audio_routing_task(
 
             SAI_ACTIVE_SIGNAL.signal(source);
             AMP_SETUP_SIGNAL.wait().await;
+
+            for led in [&mut led_usb, &mut led_rpi, &mut led_spdif] {
+                led.set_low();
+            }
+
+            info!("New source: {}", source);
+            match source {
+                AudioSource::Spdif => led_spdif.set_high(),
+                AudioSource::Usb => led_usb.set_high(),
+                AudioSource::Rpi => led_rpi.set_high(),
+                _ => (),
+            }
 
             audio_channel.clear();
             sai_rpi.start().unwrap();

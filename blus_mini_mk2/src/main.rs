@@ -1,5 +1,7 @@
+//! An application that plays music from various sources on digital amplifiers.
 #![no_std]
 #![no_main]
+#![warn(missing_docs)]
 
 use core::cell::RefCell;
 
@@ -66,6 +68,9 @@ struct SpdifResources {
     dma: peripherals::DMA1_CH1,
 }
 
+/// Get audio filters for a given sample rate.
+///
+/// The filters depend on the connected speakers.
 pub fn get_filters(sample_rate_hz: u32) -> [AudioFilter<'static>; OUTPUT_CHANNEL_COUNT] {
     use biquad::*;
 
@@ -504,7 +509,7 @@ async fn main(spawner: Spawner) {
         USB_MAX_PACKET_SIZE as u16,
         uac1::SampleWidth::Width4Byte,
         &[SAMPLE_RATE_HZ],
-        &AUDIO_CHANNELS,
+        &USB_AUDIO_CHANNELS,
         FEEDBACK_REFRESH_PERIOD,
     );
 

@@ -1,3 +1,4 @@
+//! Interfaces to the USB audio class and transports samples to the audio routing task.
 use defmt::{debug, panic};
 use embassy_stm32::{peripherals, usb};
 use embassy_sync::blocking_mutex::raw::NoopRawMutex;
@@ -99,6 +100,7 @@ async fn stream_handler<'d, T: usb::Instance + 'd>(
     }
 }
 
+/// Stream audio samples from the host.
 #[embassy_executor::task]
 pub async fn streaming_task(
     mut stream: speaker::Stream<'static, usb::Driver<'static, peripherals::USB_OTG_HS>>,
@@ -110,6 +112,7 @@ pub async fn streaming_task(
     }
 }
 
+/// Provide feedback information to the host.
 #[embassy_executor::task]
 pub async fn feedback_task(mut feedback: speaker::Feedback<'static, usb::Driver<'static, peripherals::USB_OTG_HS>>) {
     loop {
@@ -118,11 +121,18 @@ pub async fn feedback_task(mut feedback: speaker::Feedback<'static, usb::Driver<
     }
 }
 
+/// Run the USB device task.
 #[embassy_executor::task]
 pub async fn usb_task(mut usb_device: embassy_usb::UsbDevice<'static, usb::Driver<'static, peripherals::USB_OTG_HS>>) {
     usb_device.run().await;
 }
 
+/// The USB control task.
+///
+/// Provides
+/// - Volume adjustment
+/// - Sample rate adjustment (not used, is fixed)
+/// - Sample width adjustment (not used, is fixed)
 #[embassy_executor::task]
 pub async fn control_task(control_monitor: speaker::ControlMonitor<'static>) {
     loop {
@@ -131,7 +141,7 @@ pub async fn control_task(control_monitor: speaker::ControlMonitor<'static>) {
         let mut usb_gain_left = 0.0_f32;
         let mut usb_gain_right = 0.0_f32;
 
-        for channel in AUDIO_CHANNELS {
+        for channel in USB_AUDIO_CHANNELS {
             let volume = control_monitor.volume(channel).unwrap();
 
             let gain = match volume {
