@@ -468,6 +468,7 @@ name = "embassy-usb-synopsys-otg"
 version = "0.1.0"
 dependencies = [
  "critical-section",
+ "defmt",
  "embassy-sync",
  "embassy-usb-driver",
 ]
