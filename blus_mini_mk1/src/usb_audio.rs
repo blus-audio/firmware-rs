@@ -1,5 +1,5 @@
 use core::sync::atomic::Ordering::Relaxed;
-use defmt::{debug, info, panic};
+use defmt::{debug, panic};
 use embassy_stm32::{peripherals, usb};
 use embassy_sync::blocking_mutex::raw::NoopRawMutex;
 use embassy_sync::zerocopy_channel;
@@ -40,7 +40,6 @@ async fn feedback_handler<'d, T: usb::Instance + 'd>(
 
     loop {
         let counter = FEEDBACK_SIGNAL.wait().await;
-        info!("{}", counter);
 
         packet.clear();
 

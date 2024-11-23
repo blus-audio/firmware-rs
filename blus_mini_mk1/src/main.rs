@@ -38,7 +38,6 @@ static DMA_BUFFER: StaticCell<[u16; 2 * USB_MAX_SAMPLE_COUNT]> = StaticCell::new
 struct AmplifierResources {
     i2c: i2c::I2c<'static, Async>,
     pin_nsd: Output<'static>,
-    pin_irqz: Input<'static>,
 }
 
 #[embassy_executor::task]
@@ -176,9 +175,9 @@ async fn main(spawner: Spawner) {
     let usb_driver = usb::Driver::new_fs(p.USB_OTG_FS, Irqs, p.PA12, p.PA11, ep_out_buffer, usb_config);
 
     // Basic USB device configuration
-    let mut config = embassy_usb::Config::new(0x1209, 0xaf02);
+    let mut config = embassy_usb::Config::new(0x1209, 0xaf01);
     config.manufacturer = Some("elagil");
-    config.product = Some("blus-mini mk2");
+    config.product = Some("blus-mini mk1");
     config.self_powered = true;
     config.max_power = 0;
 
@@ -223,8 +222,7 @@ async fn main(spawner: Spawner) {
             Hertz(100_000),
             Default::default(),
         ),
-        pin_nsd: Output::new(p.PC13, Level::Low, Speed::Low),
-        pin_irqz: Input::new(p.PC14, Pull::None),
+        pin_nsd: Output::new(p.PB14, Level::Low, Speed::Low),
     };
 
     let dma_buffer = DMA_BUFFER.init([0x00_u16; USB_MAX_SAMPLE_COUNT * 2]);
@@ -283,7 +281,7 @@ async fn main(spawner: Spawner) {
     unwrap!(spawner.spawn(audio_routing::audio_routing_task(i2s_resources, usb_receiver)));
 
     // Amplifier setup and control.
-    // unwrap!(spawner.spawn(amplifier_task(amplifier_resources)));
+    unwrap!(spawner.spawn(amplifier_task(amplifier_resources)));
 }
 
 #[interrupt]
