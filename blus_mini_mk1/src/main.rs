@@ -9,7 +9,7 @@ use blus_fw::*;
 use defmt::{debug, info, unwrap};
 use embassy_embedded_hal::shared_bus::blocking::i2c::I2cDevice;
 use embassy_executor::Spawner;
-use embassy_stm32::gpio::{Input, Level, Output, Pull, Speed};
+use embassy_stm32::gpio::{Level, Output, Speed};
 use embassy_stm32::mode::Async;
 use embassy_stm32::time::Hertz;
 use embassy_stm32::{bind_interrupts, i2c, interrupt, peripherals, timer, usb};
