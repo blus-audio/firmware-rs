@@ -107,7 +107,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "blus-fw"
+name = "blus-mini-mk1"
 version = "0.1.0"
 dependencies = [
  "audio",
