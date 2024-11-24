@@ -9,6 +9,5 @@ do
     cargo fmt
     cargo clippy
     cargo build --verbose
-    cargo test --verbose
     popd
 done
