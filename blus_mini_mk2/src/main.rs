@@ -563,7 +563,7 @@ async fn main(spawner: Spawner) {
         StaticCell::new();
     let audio_channel = AUDIO_CHANNEL.init(channel::Channel::new());
 
-    setup_sof_timer();
+    setup_sof_timer(timer::low_level::Timer::new(p.TIM2));
 
     // Launch audio routing.
     unwrap!(spawner.spawn(audio_routing::audio_routing_task(
@@ -591,9 +591,8 @@ async fn main(spawner: Spawner) {
     unwrap!(spawner.spawn(spdif_task(spdif_resources, audio_channel.sender())));
 }
 
-fn setup_sof_timer() {
+fn setup_sof_timer(mut tim2: timer::low_level::Timer<'static, peripherals::TIM2>) {
     // Trigger a capture on USB SOF (internal signal)
-    let mut tim2 = timer::low_level::Timer::new(p.TIM2);
     tim2.set_tick_freq(Hertz(FEEDBACK_COUNTER_TICK_RATE));
     tim2.set_trigger_source(timer::low_level::TriggerSource::ITR5);
 

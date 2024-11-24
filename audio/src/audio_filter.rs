@@ -89,6 +89,13 @@ impl<'d, B: Biquad<f32>> Filter<'d, B> {
         }
     }
 
+    /// Resets the state of the internal biquad filters.
+    pub fn reset_state(&mut self) {
+        for biquad in self.biquads.as_mut() {
+            biquad.reset_state();
+        }
+    }
+
     /// Run the filter on a provided sample.
     pub fn run(&mut self, mut sample: f32) -> f32 {
         for b in self.biquads.as_mut() {

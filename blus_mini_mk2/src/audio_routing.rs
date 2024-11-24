@@ -279,6 +279,10 @@ pub async fn audio_routing_task(
             SAI_ACTIVE_SIGNAL.signal(source);
             AMP_SETUP_SIGNAL.wait().await;
 
+            for filter in filters.as_mut() {
+                filter.reset_state();
+            }
+
             for led in [&mut led_usb, &mut led_rpi, &mut led_spdif] {
                 led.set_low();
             }
