@@ -6,7 +6,7 @@
 use core::cell::RefCell;
 
 use audio::{self, AudioFilter, AudioSource};
-use blus_fw::*;
+use blus_mini_mk2::*;
 use defmt::{debug, info, unwrap};
 use embassy_embedded_hal::shared_bus::blocking::i2c::I2cDevice;
 use embassy_executor::Spawner;

@@ -5,7 +5,7 @@ use core::cell::RefCell;
 
 use audio::{self};
 use audio_routing::I2sResources;
-use blus_fw::*;
+use blus_mini_mk1::*;
 use defmt::{debug, info, unwrap};
 use embassy_embedded_hal::shared_bus::blocking::i2c::I2cDevice;
 use embassy_executor::Spawner;
