@@ -563,29 +563,7 @@ async fn main(spawner: Spawner) {
         StaticCell::new();
     let audio_channel = AUDIO_CHANNEL.init(channel::Channel::new());
 
-    // Trigger a capture on USB SOF (internal signal)
-    let mut tim2 = timer::low_level::Timer::new(p.TIM2);
-    tim2.set_tick_freq(Hertz(FEEDBACK_COUNTER_TICK_RATE));
-    tim2.set_trigger_source(timer::low_level::TriggerSource::ITR5);
-
-    const CHANNEL: timer::Channel = timer::Channel::Ch1;
-    tim2.set_input_ti_selection(CHANNEL, timer::low_level::InputTISelection::TRC);
-    tim2.set_input_capture_prescaler(CHANNEL, 0);
-    tim2.set_input_capture_filter(CHANNEL, timer::low_level::FilterValue::FCK_INT_N2);
-
-    // Reset all interrupt flags.
-    tim2.regs_gp32().sr().write(|r| r.0 = 0);
-
-    tim2.enable_channel(CHANNEL, true);
-    tim2.enable_input_interrupt(CHANNEL, true);
-
-    tim2.start();
-
-    TIMER.lock(|p| p.borrow_mut().replace(tim2));
-
-    unsafe {
-        cortex_m::peripheral::NVIC::unmask(interrupt::TIM2);
-    }
+    setup_sof_timer();
 
     // Launch audio routing.
     unwrap!(spawner.spawn(audio_routing::audio_routing_task(
@@ -611,6 +589,32 @@ async fn main(spawner: Spawner) {
 
     // S/PDIF data reception.
     unwrap!(spawner.spawn(spdif_task(spdif_resources, audio_channel.sender())));
+}
+
+fn setup_sof_timer() {
+    // Trigger a capture on USB SOF (internal signal)
+    let mut tim2 = timer::low_level::Timer::new(p.TIM2);
+    tim2.set_tick_freq(Hertz(FEEDBACK_COUNTER_TICK_RATE));
+    tim2.set_trigger_source(timer::low_level::TriggerSource::ITR5);
+
+    const CHANNEL: timer::Channel = timer::Channel::Ch1;
+    tim2.set_input_ti_selection(CHANNEL, timer::low_level::InputTISelection::TRC);
+    tim2.set_input_capture_prescaler(CHANNEL, 0);
+    tim2.set_input_capture_filter(CHANNEL, timer::low_level::FilterValue::FCK_INT_N2);
+
+    // Reset all interrupt flags.
+    tim2.regs_gp32().sr().write(|r| r.0 = 0);
+
+    tim2.enable_channel(CHANNEL, true);
+    tim2.enable_input_interrupt(CHANNEL, true);
+
+    tim2.start();
+
+    TIMER.lock(|p| p.borrow_mut().replace(tim2));
+
+    unsafe {
+        cortex_m::peripheral::NVIC::unmask(interrupt::TIM2);
+    }
 }
 
 #[interrupt]
