@@ -16,4 +16,4 @@ jobs:
         uses: actions/checkout@v2
 
       - name: Build
-        run: bash build.sh
+        run: bash .github/ci/build.sh
