@@ -1,11 +1,8 @@
 name: Rust build
 
 on:
-  workflow_call:
-    inputs:
-      target-directory:
-        required: true
-        type: string
+  push:
+  pull_request:
 
 env:
   CARGO_TERM_COLOR: always
@@ -15,16 +12,8 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
-      - name: Format
-        working-directory: ${{ inputs.target-directory }}
-        run: cargo fmt
-      - name: Lint
-        working-directory: ${{ inputs.target-directory }}
-        run: cargo clippy
+      - name: Checkout
+        uses: actions/checkout@v2
+
       - name: Build
-        working-directory: ${{ inputs.target-directory }}
-        run: cargo build --verbose
-      - name: Test
-        working-directory: ${{ inputs.target-directory }}
-        run: cargo test --verbose
+        run: bash build.sh
