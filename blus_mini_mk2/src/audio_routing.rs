@@ -240,14 +240,20 @@ pub async fn audio_routing_task(
             let sai_write_error_fut = sai_amp.wait_write_error();
 
             match source {
+                AudioSource::None => {
+                    match select3(audio_channel_receive_fut, sai_rpi_read_fut, sai_write_error_fut).await {
+                        Either3::First(sample_block) => sample_block,
+                        Either3::Second(sample_block) => sample_block,
+                        Either3::Third(_) => None,
+                    }
+                }
                 AudioSource::Rpi => match select(sai_rpi_read_fut, sai_write_error_fut).await {
                     Either::First(sample_block) => sample_block,
                     Either::Second(_) => None,
                 },
-                _ => match select3(audio_channel_receive_fut, sai_rpi_read_fut, sai_write_error_fut).await {
-                    Either3::First(sample_block) => sample_block,
-                    Either3::Second(sample_block) => sample_block,
-                    Either3::Third(_) => None,
+                _ => match select(audio_channel_receive_fut, sai_write_error_fut).await {
+                    Either::First(sample_block) => sample_block,
+                    Either::Second(_) => None,
                 },
             }
         };
