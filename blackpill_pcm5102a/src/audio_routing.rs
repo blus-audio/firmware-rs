@@ -1,0 +1,74 @@
+use defmt::info;
+use embassy_stm32::time::Hertz;
+use embassy_stm32::{i2s, peripherals};
+use embassy_sync::blocking_mutex::raw::NoopRawMutex;
+use embassy_sync::zerocopy_channel;
+use embassy_time::{Duration, WithTimeout as _};
+
+use crate::*;
+
+#[allow(unused)]
+pub struct I2sResources<'d> {
+    pub i2s: peripherals::SPI2,
+
+    pub ck: peripherals::PB10,
+    pub sd: peripherals::PB15,
+    pub ws: peripherals::PB12,
+    pub dma: peripherals::DMA1_CH4,
+    pub dma_buf: &'d mut [u16],
+}
+
+fn new_i2s<'d>(resources: &'d mut I2sResources) -> i2s::I2S<'d, u16> {
+    let mut config = i2s::Config::default();
+    config.format = i2s::Format::Data32Channel32;
+
+    i2s::I2S::new_txonly_nomck(
+        &mut resources.i2s,
+        &mut resources.sd,
+        &mut resources.ws,
+        &mut resources.ck,
+        &mut resources.dma,
+        resources.dma_buf,
+        Hertz((SAMPLE_WIDTH_BIT * INPUT_CHANNEL_COUNT * SAMPLE_RATE_HZ as usize) as u32),
+        config,
+    )
+}
+
+#[embassy_executor::task]
+pub async fn audio_routing_task(
+    mut i2s_resources: I2sResources<'static>,
+    mut usb_audio_receiver: zerocopy_channel::Receiver<'static, NoopRawMutex, UsbSampleBlock>,
+) {
+    let mut i2s_dac = new_i2s(&mut i2s_resources);
+
+    loop {
+        // Data should arrive at least once every millisecond.
+        let result = usb_audio_receiver
+            .receive()
+            .with_timeout(Duration::from_millis(2))
+            .await;
+
+        let renew = if let Ok(samples) = result {
+            let result = i2s_dac.write(samples).await;
+
+            // Notify the channel that the buffer is now ready to be reused
+            usb_audio_receiver.receive_done();
+
+            result.is_err()
+        } else {
+            false
+        };
+
+        // Renew the I2S setup in case of errors.
+        if renew {
+            info!("Renew I2S");
+            I2S_ACTIVE_SIGNAL.signal(false);
+
+            drop(i2s_dac);
+
+            i2s_dac = new_i2s(&mut i2s_resources);
+
+            I2S_ACTIVE_SIGNAL.signal(true);
+        }
+    }
+}
