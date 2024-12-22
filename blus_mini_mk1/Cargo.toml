@@ -22,7 +22,6 @@ embassy-executor = { path = "../embassy/embassy-executor", features = [
     "executor-thread",
     "executor-interrupt",
     "defmt",
-    "integrated-timers",
 ] }
 embassy-time = { path = "../embassy/embassy-time", features = [
     "defmt",
