@@ -48,7 +48,7 @@ async fn main(spawner: Spawner) {
         use embassy_stm32::rcc::*;
         peripheral_config.rcc.hse = Some(Hse {
             freq: Hertz(25_000_000),
-            mode: HseMode::Bypass,
+            mode: HseMode::Oscillator,
         });
         peripheral_config.rcc.sys = Sysclk::PLL1_P;
 
