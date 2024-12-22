@@ -14,7 +14,7 @@ use heapless::Vec;
 pub const INPUT_CHANNEL_COUNT: usize = 2;
 
 pub const SAMPLE_RATE_HZ: u32 = 48_000;
-pub const FEEDBACK_COUNTER_TICK_RATE: u32 = 42_000_000;
+pub const FEEDBACK_COUNTER_TICK_RATE: u32 = 21_000_000;
 
 pub const SAMPLE_WIDTH: uac1::SampleWidth = uac1::SampleWidth::Width4Byte;
 pub const SAMPLE_WIDTH_BIT: usize = SAMPLE_WIDTH.in_bit();

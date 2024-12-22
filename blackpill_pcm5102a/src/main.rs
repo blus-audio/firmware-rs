@@ -7,11 +7,13 @@ use audio_routing::I2sResources;
 use blackpill_pcm5102a::*;
 use defmt::{debug, info, unwrap};
 use embassy_executor::Spawner;
+use embassy_stm32::gpio::Output;
 use embassy_stm32::time::Hertz;
 use embassy_stm32::{bind_interrupts, i2c, interrupt, peripherals, timer, usb};
 use embassy_sync::blocking_mutex::raw::{CriticalSectionRawMutex, NoopRawMutex};
 use embassy_sync::blocking_mutex::Mutex;
 use embassy_sync::zerocopy_channel;
+use embassy_time::Timer;
 use embassy_usb::class::uac1;
 use embassy_usb::class::uac1::speaker::{self, Speaker};
 use heapless::Vec;
@@ -27,6 +29,14 @@ bind_interrupts!(struct Irqs {
 static TIMER: Mutex<CriticalSectionRawMutex, RefCell<Option<timer::low_level::Timer<peripherals::TIM2>>>> =
     Mutex::new(RefCell::new(None));
 static DMA_BUFFER: StaticCell<[u16; 2 * USB_MAX_SAMPLE_COUNT]> = StaticCell::new();
+
+#[embassy_executor::task]
+pub async fn blink_task(mut led_pin: Output<'static>) {
+    loop {
+        led_pin.toggle();
+        Timer::after_millis(500).await;
+    }
+}
 
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
@@ -178,6 +188,12 @@ async fn main(spawner: Spawner) {
     unsafe {
         cortex_m::peripheral::NVIC::unmask(interrupt::TIM2);
     }
+
+    unwrap!(spawner.spawn(blink_task(Output::new(
+        p.PC13,
+        embassy_stm32::gpio::Level::Low,
+        embassy_stm32::gpio::Speed::Low
+    ))));
 
     // Launch USB audio tasks.
     unwrap!(spawner.spawn(usb_audio::control_task(control_changed)));
