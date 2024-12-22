@@ -1,7 +1,7 @@
 #![no_std]
 #![no_main]
 
-use core::cell::RefCell;
+use core::cell::{Cell, RefCell};
 
 use audio_routing::I2sResources;
 use blackpill_pcm5102a::*;
@@ -94,7 +94,7 @@ async fn main(spawner: Spawner) {
     // Create the driver, from the HAL.
     let mut usb_config = usb::Config::default();
 
-    usb_config.vbus_detection = true;
+    usb_config.vbus_detection = false;
 
     // Initialize driver for high-speed external PHY.
     let usb_driver = usb::Driver::new_fs(p.USB_OTG_FS, Irqs, p.PA12, p.PA11, ep_out_buffer, usb_config);
@@ -103,8 +103,6 @@ async fn main(spawner: Spawner) {
     let mut config = embassy_usb::Config::new(0x1209, 0xaf03);
     config.manufacturer = Some("elagil");
     config.product = Some("blackpill-dac");
-    config.self_powered = true;
-    config.max_power = 0;
 
     // Required for windows compatibility.
     // https://developer.nordicsemi.com/nRF_Connect_SDK/doc/1.9.1/kconfig/CONFIG_CDC_ACM_IAD.html#help
@@ -193,8 +191,8 @@ async fn main(spawner: Spawner) {
 
 #[interrupt]
 fn TIM2() {
-    static mut LAST_TICKS: u32 = 0;
-    static mut FRAME_COUNT: usize = 0;
+    static LAST_TICKS: Mutex<CriticalSectionRawMutex, Cell<u32>> = Mutex::new(Cell::new(0));
+    static FRAME_COUNT: Mutex<CriticalSectionRawMutex, Cell<usize>> = Mutex::new(Cell::new(0));
 
     critical_section::with(|cs| {
         // Read timer counter.
@@ -206,11 +204,14 @@ fn TIM2() {
         if status.ccif(CHANNEL_INDEX) {
             let ticks = timer.ccr(CHANNEL_INDEX).read();
 
-            *FRAME_COUNT += 1;
-            if *FRAME_COUNT >= FEEDBACK_REFRESH_PERIOD.frame_count() {
-                *FRAME_COUNT = 0;
-                FEEDBACK_SIGNAL.signal(ticks.wrapping_sub(*LAST_TICKS));
-                *LAST_TICKS = ticks;
+            let frame_count = FRAME_COUNT.borrow(cs);
+            let last_ticks = LAST_TICKS.borrow(cs);
+
+            frame_count.set(frame_count.get() + 1);
+            if frame_count.get() >= FEEDBACK_REFRESH_PERIOD.frame_count() {
+                frame_count.set(0);
+                FEEDBACK_SIGNAL.signal(ticks.wrapping_sub(last_ticks.get()));
+                last_ticks.set(ticks);
             }
         };
 

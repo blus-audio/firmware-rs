@@ -48,10 +48,10 @@ pub struct Sai4Resources {
 
 // Accessible by BDMA (Zone D3)
 #[link_section = ".sram4"]
-static mut SAI_AMP_WRITE_BUFFER: GroundedArrayCell<u32, SAI_AMP_SAMPLE_COUNT> = GroundedArrayCell::uninit();
+static SAI_AMP_WRITE_BUFFER: GroundedArrayCell<u32, SAI_AMP_SAMPLE_COUNT> = GroundedArrayCell::uninit();
 
 #[link_section = ".sram4"]
-static mut SAI_RPI_READ_BUFFER: GroundedArrayCell<u32, DEFAULT_SAMPLE_COUNT> = GroundedArrayCell::uninit();
+static SAI_RPI_READ_BUFFER: GroundedArrayCell<u32, DEFAULT_SAMPLE_COUNT> = GroundedArrayCell::uninit();
 
 fn new_sai_amp_rpi<'d>(
     resources: &'d mut Sai4Resources,

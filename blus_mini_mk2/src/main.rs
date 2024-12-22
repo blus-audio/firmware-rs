@@ -3,7 +3,7 @@
 #![no_main]
 #![warn(missing_docs)]
 
-use core::cell::RefCell;
+use core::cell::{Cell, RefCell};
 
 use audio::{self, AudioFilter, AudioSource};
 use blus_mini_mk2::*;
@@ -40,12 +40,12 @@ static I2C_BUS: StaticCell<NoopMutex<RefCell<i2c::I2c<'static, Async>>>> = Stati
 
 // Accessible by most system masters (Zone D2)
 #[link_section = ".sram1"]
-static mut ADC1_MEASUREMENT_BUFFER: GroundedArrayCell<u16, 1> = GroundedArrayCell::uninit();
+static ADC1_MEASUREMENT_BUFFER: GroundedArrayCell<u16, 1> = GroundedArrayCell::uninit();
 
 // Reserve twice the SPDIF sample count, since the DMA will transfer at
 // half-full interrupt (so, at SPDIF_SAMPLE_COUNT * 2 / 2).
 #[link_section = ".sram1"]
-static mut SPDIFRX_BUFFER: GroundedArrayCell<u32, { DEFAULT_SAMPLE_COUNT * 2 }> = GroundedArrayCell::uninit();
+static SPDIFRX_BUFFER: GroundedArrayCell<u32, { DEFAULT_SAMPLE_COUNT * 2 }> = GroundedArrayCell::uninit();
 
 #[allow(unused)]
 struct AmplifierResources {
@@ -618,8 +618,8 @@ fn setup_sof_timer(mut tim2: timer::low_level::Timer<'static, peripherals::TIM2>
 
 #[interrupt]
 fn TIM2() {
-    static mut LAST_TICKS: u32 = 0;
-    static mut FRAME_COUNT: usize = 0;
+    static LAST_TICKS: Mutex<CriticalSectionRawMutex, Cell<u32>> = Mutex::new(Cell::new(0));
+    static FRAME_COUNT: Mutex<CriticalSectionRawMutex, Cell<usize>> = Mutex::new(Cell::new(0));
 
     critical_section::with(|cs| {
         // Read timer counter.
@@ -631,11 +631,14 @@ fn TIM2() {
         if status.ccif(CHANNEL_INDEX) {
             let ticks = timer.ccr(CHANNEL_INDEX).read();
 
-            *FRAME_COUNT += 1;
-            if *FRAME_COUNT >= FEEDBACK_REFRESH_PERIOD.frame_count() {
-                *FRAME_COUNT = 0;
-                FEEDBACK_SIGNAL.signal(ticks.wrapping_sub(*LAST_TICKS));
-                *LAST_TICKS = ticks;
+            let frame_count = FRAME_COUNT.borrow(cs);
+            let last_ticks = LAST_TICKS.borrow(cs);
+
+            frame_count.set(frame_count.get() + 1);
+            if frame_count.get() >= FEEDBACK_REFRESH_PERIOD.frame_count() {
+                frame_count.set(0);
+                FEEDBACK_SIGNAL.signal(ticks.wrapping_sub(last_ticks.get()));
+                last_ticks.set(ticks);
             }
         };
 
