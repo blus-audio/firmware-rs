@@ -97,6 +97,7 @@ pub static POT_GAIN_SIGNAL: Signal<ThreadModeRawMutex, f32> = Signal::new();
 // Type definitions
 /// A sample block, originating from different sources.
 #[derive(Debug)]
+#[allow(clippy::large_enum_variant)]
 pub enum SampleBlock {
     /// Samples from USB.
     Usb(UsbSampleBlock),
