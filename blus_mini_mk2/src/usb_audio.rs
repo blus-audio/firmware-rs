@@ -80,7 +80,6 @@ async fn stream_handler<'d, T: usb::Instance + 'd>(
         let word_count = data_size / SAMPLE_SIZE;
 
         if word_count * SAMPLE_SIZE == data_size {
-            // Obtain a buffer from the channel
             let mut samples: UsbSampleBlock = Vec::new();
 
             for w in 0..word_count {

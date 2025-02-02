@@ -158,9 +158,7 @@ where
     }
 
     fn write(&mut self, write: &[u8]) {
-        self.i2c
-            .write(self.address, write)
-            .expect("Failed to write to TAS2780.")
+        self.i2c.write(self.address, write).expect("Failed to write to TAS2780")
     }
 
     fn write_register(&mut self, address: RegisterAddress, value: RegisterValue) {
@@ -200,7 +198,7 @@ where
 
         self.i2c
             .write_read(self.address, &address, read)
-            .expect("Failed to read from TAS2780.")
+            .expect("Failed to read from TAS2780")
     }
 
     /// Set the attenuation in steps of 0.5 dB.
@@ -235,6 +233,8 @@ where
     }
 
     pub fn enable(&mut self) {
+        debug!("Enabling TAS2780 at address {}", self.address);
+
         // Set up power mode, and activate
         match self.config.power_mode {
             PowerMode::Two => {
@@ -244,7 +244,7 @@ where
                 self.write_register(0x71, 0x0E); // PVDD undervoltage lockout 6.5 V
                 self.write_register(0x02, 0x80); // Power up playback with I-sense, V-sense enabled
             }
-            _ => todo!("Unsupported power mode."),
+            _ => todo!("Unsupported power mode"),
         }
     }
 
@@ -256,7 +256,7 @@ where
     pub async fn init(&mut self, config: Config) {
         self.config = config;
 
-        debug!("Initializing TAS2780 at address {}.", self.address);
+        debug!("Initializing TAS2780 at address {}", self.address);
 
         // Pre-reset configuration (as per the datasheet)
         self.set_page(0x01);
@@ -327,7 +327,6 @@ where
 
         // Set up the noise gate, if enabled
         if let Some(noise_gate) = self.config.noise_gate {
-            debug!("Enable TAS2780 noise gate.");
             const ENABLE_NOISE_GATE: u8 = 0b1;
 
             /// Noise gate config register 0
@@ -353,7 +352,7 @@ where
                 self.write_register(0x3E, 0x4A); // Optimal Dmin
                 self.write_register(0x0D, 0x00); // Remove page access
             }
-            _ => todo!("Unsupported power mode."),
+            _ => todo!("Unsupported power mode"),
         }
 
         // Set maximum volume (0 dB)

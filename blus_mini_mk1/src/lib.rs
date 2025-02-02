@@ -3,11 +3,9 @@
 pub mod audio_routing;
 pub mod usb_audio;
 
-use core::sync::atomic::AtomicBool;
 use embassy_sync::blocking_mutex::raw::{CriticalSectionRawMutex, ThreadModeRawMutex};
 use embassy_sync::signal::Signal;
 use embassy_usb::class::uac1;
-use embassy_usb::class::uac1::speaker::Volume;
 use heapless::Vec;
 
 // Stereo input -> two two-way speakers
@@ -35,11 +33,9 @@ pub const USB_MAX_PACKET_SIZE: usize = 2 * USB_FRAME_SIZE;
 pub const USB_MAX_SAMPLE_COUNT: usize = USB_MAX_PACKET_SIZE / SAMPLE_SIZE;
 
 // Task communication
-pub static USB_IS_STREAMING: AtomicBool = AtomicBool::new(false);
-
 pub static FEEDBACK_SIGNAL: Signal<CriticalSectionRawMutex, u32> = Signal::new();
 pub static I2S_ACTIVE_SIGNAL: Signal<ThreadModeRawMutex, bool> = Signal::new();
-pub static VOLUME_SIGNAL: Signal<ThreadModeRawMutex, (Volume, Volume)> = Signal::new();
+pub static VOLUME_SIGNAL: Signal<ThreadModeRawMutex, (f32, f32)> = Signal::new();
 
 // Type definitions
-pub type UsbSampleBlock = Vec<u16, { 2 * USB_MAX_SAMPLE_COUNT }>;
+pub type UsbSampleBlock = Vec<u32, USB_MAX_SAMPLE_COUNT>;

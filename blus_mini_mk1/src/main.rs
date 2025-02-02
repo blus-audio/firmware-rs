@@ -1,7 +1,7 @@
 #![no_std]
 #![no_main]
 
-use core::cell::RefCell;
+use core::cell::{Cell, RefCell};
 
 use audio::{self};
 use audio_routing::I2sResources;
@@ -32,7 +32,7 @@ bind_interrupts!(struct Irqs {
 static TIMER: Mutex<CriticalSectionRawMutex, RefCell<Option<timer::low_level::Timer<peripherals::TIM2>>>> =
     Mutex::new(RefCell::new(None));
 static I2C_BUS: StaticCell<NoopMutex<RefCell<i2c::I2c<'static, Async>>>> = StaticCell::new();
-static DMA_BUFFER: StaticCell<[u16; 2 * USB_MAX_SAMPLE_COUNT]> = StaticCell::new();
+static DMA_BUFFER: StaticCell<[u16; 4 * USB_MAX_SAMPLE_COUNT]> = StaticCell::new();
 
 #[allow(unused)]
 struct AmplifierResources {
@@ -94,12 +94,12 @@ async fn amplifier_task(amplifier_resources: AmplifierResources) {
         })
         .await;
 
+    for amplifier in [&mut tas2780_a, &mut tas2780_b, &mut tas2780_c, &mut tas2780_d] {
+        amplifier.enable();
+    }
+
     loop {
-        if I2S_ACTIVE_SIGNAL.wait().await {
-            for amplifier in [&mut tas2780_a, &mut tas2780_b, &mut tas2780_c, &mut tas2780_d] {
-                amplifier.enable();
-            }
-        }
+        if I2S_ACTIVE_SIGNAL.wait().await {}
     }
 }
 
@@ -225,13 +225,12 @@ async fn main(spawner: Spawner) {
         pin_nsd: Output::new(p.PB14, Level::Low, Speed::Low),
     };
 
-    let dma_buffer = DMA_BUFFER.init([0x00_u16; USB_MAX_SAMPLE_COUNT * 2]);
+    let dma_buffer = DMA_BUFFER.init([0x00_u16; USB_MAX_SAMPLE_COUNT * 4]);
     let i2s_resources = I2sResources {
         i2s: p.SPI3,
         ck: p.PC10,
         sd: p.PC12,
         ws: p.PA4,
-        mck: p.PC7,
         dma: p.DMA1_CH7,
         dma_buf: dma_buffer,
     };
@@ -286,8 +285,8 @@ async fn main(spawner: Spawner) {
 
 #[interrupt]
 fn TIM2() {
-    static mut LAST_TICKS: u32 = 0;
-    static mut FRAME_COUNT: usize = 0;
+    static LAST_TICKS: Mutex<CriticalSectionRawMutex, Cell<u32>> = Mutex::new(Cell::new(0));
+    static FRAME_COUNT: Mutex<CriticalSectionRawMutex, Cell<usize>> = Mutex::new(Cell::new(0));
 
     critical_section::with(|cs| {
         // Read timer counter.
@@ -299,11 +298,14 @@ fn TIM2() {
         if status.ccif(CHANNEL_INDEX) {
             let ticks = timer.ccr(CHANNEL_INDEX).read();
 
-            *FRAME_COUNT += 1;
-            if *FRAME_COUNT >= FEEDBACK_REFRESH_PERIOD.frame_count() {
-                *FRAME_COUNT = 0;
-                FEEDBACK_SIGNAL.signal(ticks.wrapping_sub(*LAST_TICKS));
-                *LAST_TICKS = ticks;
+            let frame_count = FRAME_COUNT.borrow(cs);
+            let last_ticks = LAST_TICKS.borrow(cs);
+
+            frame_count.set(frame_count.get() + 1);
+            if frame_count.get() >= FEEDBACK_REFRESH_PERIOD.frame_count() {
+                frame_count.set(0);
+                FEEDBACK_SIGNAL.signal(ticks.wrapping_sub(last_ticks.get()));
+                last_ticks.set(ticks);
             }
         };
 
