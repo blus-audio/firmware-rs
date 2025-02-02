@@ -2,6 +2,7 @@
 #![no_std]
 #![no_main]
 #![warn(missing_docs)]
+#![allow(clippy::excessive_precision)]
 
 use core::cell::{Cell, RefCell};
 
@@ -282,17 +283,10 @@ async fn potentiometer_task(mut adc_resources: AdcResources<peripherals::ADC1>) 
             )
             .await;
 
-        let mut gain = filter.run((buffer[0] as f32) / 65535f32);
+        let gain = filter.run((buffer[0] as f32) / 65535f32);
 
-        // Clamping.
-        if gain < 0.0 {
-            gain = 0.0;
-        } else if gain > 1.0 {
-            gain = 1.0;
-        }
-
-        // Make gain exponential
-        let exp_gain = gain.powf(2.0);
+        // Clamp, and make gain exponential
+        let exp_gain = gain.clamp(0.0, 1.0).powf(2.0);
         POT_GAIN_SIGNAL.signal(exp_gain);
     }
 }

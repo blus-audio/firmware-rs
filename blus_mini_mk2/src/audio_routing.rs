@@ -153,8 +153,8 @@ fn process(
     gain_left: f32,
     gain_right: f32,
 ) {
-    for index in 0..samples.len() {
-        let sample = audio_filter::sample_to_f32(samples[index]);
+    for (index, sample) in samples.iter().enumerate() {
+        let sample = audio_filter::sample_to_f32(*sample);
 
         if index % 2 == 0 {
             // Left channel
