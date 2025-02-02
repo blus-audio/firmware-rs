@@ -1,13 +1,11 @@
 #!/bin/bash
 set -euo pipefail
 
-DIRS=("blus_mini_mk1" "blus_mini_mk2")
-
-for dir in $DIRS;
+for dir in blus_mini_mk1 blus_mini_mk2 blackpill_pcm5102a;
 do
     pushd $dir
     cargo fmt
     cargo clippy
-    cargo build --verbose
+    cargo build --release
     popd
 done

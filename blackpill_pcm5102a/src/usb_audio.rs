@@ -1,4 +1,4 @@
-use core::sync::atomic::Ordering::Relaxed;
+use audio::db_to_linear;
 use defmt::{debug, panic};
 use embassy_stm32::{peripherals, usb};
 use embassy_sync::blocking_mutex::raw::NoopRawMutex;
@@ -74,8 +74,7 @@ async fn stream_handler<'d, T: usb::Instance + 'd>(
                 let sample = u32::from_le_bytes(usb_data[byte_offset..byte_offset + SAMPLE_SIZE].try_into().unwrap());
 
                 // Fill the sample buffer with data.
-                samples.push(sample as u16).unwrap();
-                samples.push((sample >> 16) as u16).unwrap();
+                samples.push(sample).unwrap();
             }
 
             sender.send_done();
@@ -92,9 +91,7 @@ pub async fn streaming_task(
 ) {
     loop {
         stream.wait_connection().await;
-        USB_IS_STREAMING.store(true, Relaxed);
         _ = stream_handler(&mut stream, &mut sender).await;
-        USB_IS_STREAMING.store(false, Relaxed);
     }
 }
 
@@ -114,28 +111,45 @@ pub async fn usb_task(mut usb_device: embassy_usb::UsbDevice<'static, usb::Drive
     usb_device.run().await;
 }
 
+/// The USB control task.
+///
+/// Provides
+/// - Volume adjustment
+/// - Sample rate adjustment (not used, is fixed)
+/// - Sample width adjustment (not used, is fixed)
 #[embassy_executor::task]
 pub async fn control_task(control_monitor: speaker::ControlMonitor<'static>) {
     loop {
         control_monitor.changed().await;
 
-        let mut volume_left = Volume::Muted;
-        let mut volume_right = Volume::Muted;
+        let mut usb_gain_left = 0.0_f32;
+        let mut usb_gain_right = 0.0_f32;
 
         for channel in AUDIO_CHANNELS {
             let volume = control_monitor.volume(channel).unwrap();
 
+            let gain = match volume {
+                speaker::Volume::Muted => 0.0,
+                speaker::Volume::DeciBel(volume_db) => {
+                    if volume_db > 0.0 {
+                        panic!("Volume must not be positive.")
+                    }
+
+                    db_to_linear(volume_db)
+                }
+            };
+
             match channel {
                 uac1::Channel::LeftFront => {
-                    volume_left = volume;
+                    usb_gain_left = gain;
                 }
                 uac1::Channel::RightFront => {
-                    volume_right = volume;
+                    usb_gain_right = gain;
                 }
                 _ => (),
             }
         }
 
-        VOLUME_SIGNAL.signal((volume_left, volume_right));
+        VOLUME_SIGNAL.signal((usb_gain_left, usb_gain_right));
     }
 }

@@ -1,26 +1,19 @@
-use core::sync::atomic::Ordering::Relaxed;
+use audio::db_to_linear;
 use defmt::{debug, panic};
 use embassy_stm32::{peripherals, usb};
 use embassy_sync::blocking_mutex::raw::NoopRawMutex;
 use embassy_sync::zerocopy_channel;
 use embassy_usb::class::uac1::speaker;
 use embassy_usb::driver::EndpointError;
-use static_assertions;
+use micromath::F32Ext;
 
 use crate::*;
 
 // Number of ticks of the feedback timer per audio sample period.
-const TICKS_PER_SAMPLE: u32 = FEEDBACK_COUNTER_TICK_RATE / SAMPLE_RATE_HZ;
-static_assertions::const_assert_eq!(TICKS_PER_SAMPLE * SAMPLE_RATE_HZ, FEEDBACK_COUNTER_TICK_RATE);
+const TICKS_PER_SAMPLE: f32 = (FEEDBACK_COUNTER_TICK_RATE as f32) / (SAMPLE_RATE_HZ as f32);
 
 // Feedback is provided in 10.14 format for full-speed endpoints.
 const FEEDBACK_SHIFT: usize = 14;
-
-const FEEDBACK_FACTOR: u32 = ((1 << FEEDBACK_SHIFT) / TICKS_PER_SAMPLE) / FEEDBACK_REFRESH_PERIOD.frame_count() as u32;
-static_assertions::const_assert_eq!(
-    (FEEDBACK_FACTOR << (FEEDBACK_REFRESH_PERIOD as usize)) * TICKS_PER_SAMPLE,
-    (1 << FEEDBACK_SHIFT)
-);
 
 struct Disconnected {}
 
@@ -33,18 +26,26 @@ impl From<EndpointError> for Disconnected {
     }
 }
 
+/// Sends feedback messages to the host.
 async fn feedback_handler<'d, T: usb::Instance + 'd>(
     feedback: &mut speaker::Feedback<'d, usb::Driver<'d, T>>,
+    feedback_factor: f32,
 ) -> Result<(), Disconnected> {
     let mut packet: Vec<u8, 4> = Vec::new();
+
+    // Collects the fractional component of the feedback value that is lost by rounding.
+    let mut rest = 0.0_f32;
 
     loop {
         let counter = FEEDBACK_SIGNAL.wait().await;
 
         packet.clear();
 
-        let value = counter * FEEDBACK_FACTOR;
+        let raw_value = counter as f32 * feedback_factor + rest;
+        let value = raw_value.round();
+        rest = raw_value - value;
 
+        let value = value as u32;
         packet.push(value as u8).unwrap();
         packet.push((value >> 8) as u8).unwrap();
         packet.push((value >> 16) as u8).unwrap();
@@ -73,8 +74,7 @@ async fn stream_handler<'d, T: usb::Instance + 'd>(
                 let sample = u32::from_le_bytes(usb_data[byte_offset..byte_offset + SAMPLE_SIZE].try_into().unwrap());
 
                 // Fill the sample buffer with data.
-                samples.push(sample as u16).unwrap();
-                samples.push((sample >> 16) as u16).unwrap();
+                samples.push(sample).unwrap();
             }
 
             sender.send_done();
@@ -91,17 +91,18 @@ pub async fn streaming_task(
 ) {
     loop {
         stream.wait_connection().await;
-        USB_IS_STREAMING.store(true, Relaxed);
         _ = stream_handler(&mut stream, &mut sender).await;
-        USB_IS_STREAMING.store(false, Relaxed);
     }
 }
 
 #[embassy_executor::task]
 pub async fn feedback_task(mut feedback: speaker::Feedback<'static, usb::Driver<'static, peripherals::USB_OTG_FS>>) {
+    let feedback_factor =
+        ((1 << FEEDBACK_SHIFT) as f32 / TICKS_PER_SAMPLE) / FEEDBACK_REFRESH_PERIOD.frame_count() as f32;
+
     loop {
         feedback.wait_connection().await;
-        _ = feedback_handler(&mut feedback).await;
+        _ = feedback_handler(&mut feedback, feedback_factor).await;
     }
 }
 
@@ -110,28 +111,45 @@ pub async fn usb_task(mut usb_device: embassy_usb::UsbDevice<'static, usb::Drive
     usb_device.run().await;
 }
 
+/// The USB control task.
+///
+/// Provides
+/// - Volume adjustment
+/// - Sample rate adjustment (not used, is fixed)
+/// - Sample width adjustment (not used, is fixed)
 #[embassy_executor::task]
 pub async fn control_task(control_monitor: speaker::ControlMonitor<'static>) {
     loop {
         control_monitor.changed().await;
 
-        let mut volume_left = Volume::Muted;
-        let mut volume_right = Volume::Muted;
+        let mut usb_gain_left = 0.0_f32;
+        let mut usb_gain_right = 0.0_f32;
 
         for channel in AUDIO_CHANNELS {
             let volume = control_monitor.volume(channel).unwrap();
 
+            let gain = match volume {
+                speaker::Volume::Muted => 0.0,
+                speaker::Volume::DeciBel(volume_db) => {
+                    if volume_db > 0.0 {
+                        panic!("Volume must not be positive.")
+                    }
+
+                    db_to_linear(volume_db)
+                }
+            };
+
             match channel {
                 uac1::Channel::LeftFront => {
-                    volume_left = volume;
+                    usb_gain_left = gain;
                 }
                 uac1::Channel::RightFront => {
-                    volume_right = volume;
+                    usb_gain_right = gain;
                 }
                 _ => (),
             }
         }
 
-        VOLUME_SIGNAL.signal((volume_left, volume_right));
+        VOLUME_SIGNAL.signal((usb_gain_left, usb_gain_right));
     }
 }

@@ -28,7 +28,7 @@ bind_interrupts!(struct Irqs {
 
 static TIMER: Mutex<CriticalSectionRawMutex, RefCell<Option<timer::low_level::Timer<peripherals::TIM2>>>> =
     Mutex::new(RefCell::new(None));
-static DMA_BUFFER: StaticCell<[u16; 2 * USB_MAX_SAMPLE_COUNT]> = StaticCell::new();
+static DMA_BUFFER: StaticCell<[u16; 4 * USB_MAX_SAMPLE_COUNT]> = StaticCell::new();
 
 #[embassy_executor::task]
 pub async fn blink_task(mut led_pin: Output<'static>) {
@@ -74,6 +74,8 @@ async fn main(spawner: Spawner) {
             divq: None,
             divr: Some(PllRDiv::DIV5),
         });
+
+        peripheral_config.enable_debug_during_sleep = true;
     }
     let p = embassy_stm32::init(peripheral_config);
 
@@ -144,7 +146,7 @@ async fn main(spawner: Spawner) {
     // Build and run the USB device
     let usb_device = builder.build();
 
-    let dma_buffer = DMA_BUFFER.init([0x00_u16; USB_MAX_SAMPLE_COUNT * 2]);
+    let dma_buffer = DMA_BUFFER.init([0x00_u16; USB_MAX_SAMPLE_COUNT * 4]);
     let i2s_resources = I2sResources {
         i2s: p.SPI2,
         ck: p.PB10,

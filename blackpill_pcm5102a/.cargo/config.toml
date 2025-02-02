@@ -5,4 +5,4 @@ runner = 'probe-rs run --chip STM32F401CCUx'
 target = "thumbv7em-none-eabihf"
 
 [env]
-DEFMT_LOG = "debug"
+DEFMT_LOG = "info"
