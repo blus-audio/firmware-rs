@@ -22,7 +22,7 @@ jobs:
       - name: Cache build
         uses: Swatinem/rust-cache@v2
         with:
-          cache-directories: |
+          workspaces: |
             blus_mini_mk1
             blus_mini_mk2
             blackpill_pcm5102a
