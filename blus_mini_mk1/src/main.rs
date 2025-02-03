@@ -3,7 +3,6 @@
 
 use core::cell::{Cell, RefCell};
 
-use audio::{self};
 use audio_routing::I2sResources;
 use blus_mini_mk1::*;
 use defmt::{debug, info, unwrap};
