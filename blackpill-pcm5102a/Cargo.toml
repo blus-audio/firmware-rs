@@ -1,6 +1,6 @@
 [package]
 edition = "2021"
-name = "blackpill_pcm5102a"
+name = "blackpill-pcm5102a"
 version = "0.1.0"
 license = "GPL-3.0"
 

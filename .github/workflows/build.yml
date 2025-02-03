@@ -20,9 +20,9 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: |
-            blus_mini_mk1
-            blus_mini_mk2
-            blackpill_pcm5102a
+            blus-mini-mk1
+            blus-mini-mk2
+            blackpill-pcm5102a
 
       - name: Build
         run: bash .github/ci/build.sh
@@ -32,5 +32,5 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/')
         with:
           files: |
-            blackpill_pcm5102a/target/thumbv7em-none-eabihf/release/blackpill_pcm5102a
-            blus_mini_mk2/target/thumbv7em-none-eabihf/release/blus_mini_mk2
+            blackpill-pcm5102a/target/thumbv7em-none-eabihf/release/blackpill-pcm5102a
+            blus-mini-mk2/target/thumbv7em-none-eabihf/release/blus-mini-mk2
