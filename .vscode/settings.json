@@ -4,6 +4,5 @@
         "blackpill_pcm5102a/Cargo.toml",
         "blus_mini_mk1/Cargo.toml",
         "blus_mini_mk2/Cargo.toml",
-        "testing/Cargo.toml"
     ]
 }

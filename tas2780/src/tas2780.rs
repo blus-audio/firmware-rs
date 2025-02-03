@@ -1,7 +1,7 @@
 //! A driver for controlling the TAS2780 class-D amplifier.
 use defmt::debug;
 use embassy_time::Timer;
-use embedded_hal_1::i2c;
+use embedded_hal::i2c;
 
 type RegisterAddress = u8;
 type RegisterValue = u8;
