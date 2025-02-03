@@ -25,3 +25,4 @@ jobs:
         with:
           files: |
             blackpill_pcm5102a/target/thumbv7em-none-eabihf/release/blackpill_pcm5102a
+            blus_mini_mk2/target/thumbv7em-none-eabihf/release/blus_mini_mk2
