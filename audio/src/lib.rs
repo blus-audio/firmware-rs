@@ -1,7 +1,6 @@
 #![no_std]
 
 pub mod audio_filter;
-pub mod tas2780;
 
 use micromath::F32Ext;
 
