@@ -16,9 +16,6 @@ jobs:
         with:
           submodules: true
 
-      - name: Build
-        run: bash .github/ci/build.sh
-
       - name: Cache build
         uses: Swatinem/rust-cache@v2
         with:
@@ -26,6 +23,9 @@ jobs:
             blus_mini_mk1
             blus_mini_mk2
             blackpill_pcm5102a
+
+      - name: Build
+        run: bash .github/ci/build.sh
 
       - name: Release
         uses: softprops/action-gh-release@v2
