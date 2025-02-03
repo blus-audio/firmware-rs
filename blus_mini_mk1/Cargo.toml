@@ -6,6 +6,8 @@ license = "GPL-3.0"
 
 [dependencies]
 audio = { path = "../audio" }
+tas2780 = { path = "../tas2780" }
+
 embassy-stm32 = { version = "0.2.0", features = [
     "defmt",
     "stm32f401rb",

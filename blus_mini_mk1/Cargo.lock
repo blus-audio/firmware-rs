@@ -128,6 +128,7 @@ dependencies = [
  "panic-probe",
  "static_assertions",
  "static_cell",
+ "tas2780",
 ]
 
 [[package]]
@@ -911,6 +912,15 @@ dependencies = [
  "proc-macro2",
  "quote",
  "unicode-ident",
+]
+
+[[package]]
+name = "tas2780"
+version = "0.1.0"
+dependencies = [
+ "defmt",
+ "embassy-time",
+ "embedded-hal 1.0.0",
 ]
 
 [[package]]
