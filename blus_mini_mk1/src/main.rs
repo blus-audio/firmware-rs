@@ -42,7 +42,7 @@ struct AmplifierResources {
 
 #[embassy_executor::task]
 async fn amplifier_task(amplifier_resources: AmplifierResources) {
-    use audio::tas2780::*;
+    use tas2780::tas2780::*;
 
     let mut pin_nsd = amplifier_resources.pin_nsd;
 
