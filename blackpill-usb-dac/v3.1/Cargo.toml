@@ -1,35 +1,37 @@
 [package]
 edition = "2021"
-name = "blackpill-pcm5102a"
+name = "blackpill-3_1-usb-dac"
 version = "0.1.0"
 license = "GPL-3.0"
 
 [dependencies]
-audio = { path = "../audio" }
-embassy-stm32 = { version = "0.2.0", features = [
+audio = { path = "../../audio" }
+blackpill-common = { path = "../common" }
+embassy-stm32 = { path = "../../embassy/embassy-stm32", features = [
     "defmt",
-    "stm32f401cc",
+    "stm32f411ce",
     "unstable-pac",
     "memory-x",
     "time-driver-tim1",
     "exti",
     "chrono",
 ] }
-embassy-sync = { version = "0.6.2", features = ["defmt"] }
-embassy-executor = { version = "0.7.0", features = [
+embassy-sync = { path = "../../embassy/embassy-sync", features = ["defmt"] }
+embassy-executor = { path = "../../embassy/embassy-executor", features = [
     "task-arena-size-32768",
     "arch-cortex-m",
     "executor-thread",
     "executor-interrupt",
     "defmt",
 ] }
-embassy-time = { version = "0.4.0", features = [
+embassy-time = { path = "../../embassy/embassy-time", features = [
     "defmt",
     "defmt-timestamp-uptime",
     "tick-hz-32_768",
 ] }
-embassy-usb = { version = "0.4.0", features = ["defmt"] }
-embassy-futures = "0.1.1"
+embassy-usb = { path = "../../embassy/embassy-usb", features = ["defmt"] }
+embassy-futures = { path = "../../embassy/embassy-futures" }
+embassy-embedded-hal = { path = "../../embassy/embassy-embedded-hal" }
 
 defmt = "0.3"
 defmt-rtt = "0.4"
@@ -39,7 +41,6 @@ cortex-m = { version = "0.7", features = [
     "critical-section-single-core",
 ] }
 cortex-m-rt = "0.7"
-embassy-embedded-hal = "0.3.0"
 panic-probe = { version = "0.3", features = ["print-defmt"] }
 heapless = { version = "0.8", default-features = false }
 critical-section = "1.2"

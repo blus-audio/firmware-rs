@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-for dir in blus-mini-mk1 blus-mini-mk2 blackpill-pcm5102a;
+for dir in blus-mini-mk1 blus-mini-mk2 blackpill-usb-dac/v1.2 blackpill-usb-dac/v3.1;
 do
     pushd $dir
     cargo fmt

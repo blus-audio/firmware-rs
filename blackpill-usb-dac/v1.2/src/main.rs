@@ -1,10 +1,12 @@
 #![no_std]
 #![no_main]
 
+mod audio_routing;
+
 use core::cell::{Cell, RefCell};
 
 use audio_routing::I2sResources;
-use blackpill_pcm5102a::*;
+use blackpill_common::*;
 use defmt::{debug, info, unwrap};
 use embassy_executor::Spawner;
 use embassy_stm32::gpio::Output;
