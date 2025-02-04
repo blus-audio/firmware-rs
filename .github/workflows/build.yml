@@ -22,7 +22,8 @@ jobs:
           workspaces: |
             blus-mini-mk1
             blus-mini-mk2
-            blackpill-pcm5102a
+            blackpill-usb-dac/v1.2
+            blackpill-usb-dac/v3.1
 
       - name: Build
         run: bash .github/ci/build.sh
@@ -32,5 +33,6 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/')
         with:
           files: |
-            blackpill-pcm5102a/target/thumbv7em-none-eabihf/release/blackpill-pcm5102a
+            blackpill-usb-dac/v1.2/target/thumbv7em-none-eabihf/release/blackpill-1_2-usb-dac
+            blackpill-usb-dac/v3.1/target/thumbv7em-none-eabihf/release/blackpill-3_1-usb-dac
             blus-mini-mk2/target/thumbv7em-none-eabihf/release/blus-mini-mk2

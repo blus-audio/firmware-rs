@@ -1,8 +1,8 @@
 {
-    // Comment out the project to analyze.
     "rust-analyzer.linkedProjects": [
-        "blackpill_pcm5102a/Cargo.toml",
-        "blus_mini_mk1/Cargo.toml",
-        "blus_mini_mk2/Cargo.toml",
+        "blackpill-usb-dac/v1.2/Cargo.toml",
+        "blackpill-usb-dac/v3.1/Cargo.toml",
+        "blus-mini-mk1/Cargo.toml",
+        "blus-mini-mk2/Cargo.toml",
     ]
 }

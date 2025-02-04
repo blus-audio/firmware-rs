@@ -1,0 +1,18 @@
+[package]
+edition = "2021"
+name = "blackpill-common"
+version = "0.1.0"
+license = "GPL-3.0"
+
+[dependencies]
+audio = { path = "../../audio" }
+
+embassy-stm32 = { path = "../../embassy/embassy-stm32" }
+embassy-sync = { path = "../../embassy/embassy-sync", features = ["defmt"] }
+embassy-usb = { path = "../../embassy/embassy-usb", features = ["defmt"] }
+embassy-executor = { path = "../../embassy/embassy-executor" }
+
+micromath = "2.1.0"
+heapless = { version = "0.8", default-features = false }
+defmt = "0.3"
+defmt-rtt = "0.4"

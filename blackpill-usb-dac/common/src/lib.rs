@@ -1,6 +1,5 @@
 #![no_std]
 
-pub mod audio_routing;
 pub mod usb_audio;
 
 use embassy_sync::blocking_mutex::raw::{CriticalSectionRawMutex, ThreadModeRawMutex};
