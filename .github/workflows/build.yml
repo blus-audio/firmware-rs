@@ -16,6 +16,9 @@ jobs:
         with:
           submodules: true
 
+      - name: Install dependencies
+        run: cargo install cargo-objcopy
+
       - name: Cache build
         uses: Swatinem/rust-cache@v2
         with:
