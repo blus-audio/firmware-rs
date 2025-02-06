@@ -7,5 +7,6 @@ do
     cargo fmt
     cargo clippy -- -D warnings
     cargo build --release
+    cargo objcopy --release -- -O binary fw-${dir//\//-}.bin
     popd
 done
