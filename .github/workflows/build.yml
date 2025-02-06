@@ -17,7 +17,7 @@ jobs:
           submodules: true
 
       - name: Install dependencies
-        run: cargo install cargo-objcopy
+        run: cargo install cargo-binutils
 
       - name: Cache build
         uses: Swatinem/rust-cache@v2
@@ -35,5 +35,6 @@ jobs:
         uses: softprops/action-gh-release@v2
         if: startsWith(github.ref, 'refs/tags/')
         with:
+          generate_release_notes: true
           files: |
             ./**/fw-*.bin
